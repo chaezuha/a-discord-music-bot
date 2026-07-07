@@ -94,7 +94,9 @@ class Music(commands.Cog):
 
     # -- commands ----------------------------------------------------------
 
-    @app_commands.command(description="Play a URL or search for a song (queues if something is already playing)")
+    @app_commands.command(
+        description="Play a URL or search for a song (queues if something is already playing)"
+    )
     @app_commands.describe(
         query="A URL, or words to search for",
         source="Where to search when the query isn't a URL (default: YouTube)",
@@ -194,8 +196,7 @@ class Music(commands.Cog):
             )
         for i, track in enumerate(list(player.queue)[:QUEUE_PAGE_SIZE], start=1):
             lines.append(
-                f"`{i}.` **{track.title}** ({fmt_duration(track.duration)}) "
-                f"— {track.requested_by}"
+                f"`{i}.` **{track.title}** ({fmt_duration(track.duration)}) — {track.requested_by}"
             )
         remaining = len(player.queue) - QUEUE_PAGE_SIZE
         if remaining > 0:

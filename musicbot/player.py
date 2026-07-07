@@ -91,10 +91,8 @@ class GuildPlayer:
                 self._track_added.clear()
                 if not self.queue:
                     try:
-                        await asyncio.wait_for(
-                            self._track_added.wait(), timeout=self.idle_timeout
-                        )
-                    except TimeoutError:
+                        await asyncio.wait_for(self._track_added.wait(), timeout=self.idle_timeout)
+                    except asyncio.TimeoutError:
                         await self._say(
                             "\N{WAVING HAND SIGN} Nothing has played for a while — disconnecting."
                         )

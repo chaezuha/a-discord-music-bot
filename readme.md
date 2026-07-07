@@ -1,5 +1,7 @@
 # a-discord-music-bot
 
+[![CI](https://github.com/chaezuha/a-discord-music-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/chaezuha/a-discord-music-bot/actions/workflows/ci.yml)
+
 A self-hostable Discord music bot that streams audio into voice channels using
 **yt-dlp** + **ffmpeg**. Paste a URL from any yt-dlp-supported site, or search
 YouTube/SoundCloud and pick from the top 10 results in a dropdown.
@@ -67,6 +69,22 @@ Slash commands sync automatically on startup. Global sync can take up to an
 hour to show up in Discord — set `DEV_GUILD_ID` in `.env` to your server's ID
 for instant sync while testing.
 
+### Run with Docker (alternative)
+
+Instead of steps 1 and 3–4 above, you can use the prebuilt image (ffmpeg
+included). You still need a bot token in `.env`:
+
+```sh
+docker run --env-file .env ghcr.io/chaezuha/a-discord-music-bot:latest
+```
+
+Or build it yourself:
+
+```sh
+docker build -t a-discord-music-bot .
+docker run --env-file .env a-discord-music-bot
+```
+
 ## Configuration (`.env`)
 
 | Variable | Required | Description |
@@ -74,6 +92,19 @@ for instant sync while testing.
 | `DISCORD_TOKEN` | yes | Bot token from the Developer Portal. |
 | `DEV_GUILD_ID` | no | Server ID for instant slash-command sync during development. |
 | `IDLE_TIMEOUT_SECONDS` | no | Idle seconds before auto-disconnect (default `180`). |
+
+## Development
+
+```sh
+pip install -r requirements-dev.txt
+pytest            # unit + async player tests (no network needed)
+ruff check .      # lint
+ruff format .     # format
+```
+
+CI runs lint, the test suite on Python 3.10/3.12/3.14, and a Docker build
+check on every push and PR. Pushes to `main` and `v*` tags publish the image
+to GHCR.
 
 ## Notes
 

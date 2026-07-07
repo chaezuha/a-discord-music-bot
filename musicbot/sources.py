@@ -52,7 +52,7 @@ def fmt_duration(seconds: float | None) -> str:
 def _clean_error(exc: Exception) -> str:
     message = str(exc)
     if message.startswith("ERROR:"):
-        message = message[len("ERROR:"):].strip()
+        message = message[len("ERROR:") :].strip()
     return message or "unknown extraction error"
 
 
