@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/chaezuha/a-discord-music-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/chaezuha/a-discord-music-bot/actions/workflows/ci.yml)
 
+Note: This project is for educational and individual purposes
+
 A self-hostable Discord music bot that streams audio into voice channels using
 **yt-dlp** + **ffmpeg**. Paste a URL from any yt-dlp-supported site, or search
 YouTube/SoundCloud and pick from the top 10 results in a dropdown.
@@ -16,15 +18,15 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `/play <query> [source]` | Play a URL, or search and pick from the top 10 results. Queues the track if something is already playing. |
-| `/pause` | Pause playback (stays connected). |
-| `/resume` | Resume paused playback. |
-| `/skip` | Skip the current track. If the queue is empty, disconnects. |
-| `/queue` | Show the current track and upcoming queue. |
-| `/remove <number or name>` | Remove a queued track by its `/queue` number or closest-matching name. |
-| `/stop` | Stop everything: clears the queue and disconnects. |
+| Command                    | What it does                                                                                              |
+| -------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `/play <query> [source]`   | Play a URL, or search and pick from the top 10 results. Queues the track if something is already playing. |
+| `/pause`                   | Pause playback (stays connected).                                                                         |
+| `/resume`                  | Resume paused playback.                                                                                   |
+| `/skip`                    | Skip the current track. If the queue is empty, disconnects.                                               |
+| `/queue`                   | Show the current track and upcoming queue.                                                                |
+| `/remove <number or name>` | Remove a queued track by its `/queue` number or closest-matching name.                                    |
+| `/stop`                    | Stop everything: clears the queue and disconnects.                                                        |
 
 ## Setup
 
@@ -87,11 +89,11 @@ docker run --env-file .env a-discord-music-bot
 
 ## Configuration (`.env`)
 
-| Variable | Required | Description |
-|---|---|---|
-| `DISCORD_TOKEN` | yes | Bot token from the Developer Portal. |
-| `DEV_GUILD_ID` | no | Server ID for instant slash-command sync during development. |
-| `IDLE_TIMEOUT_SECONDS` | no | Idle seconds before auto-disconnect (default `180`). |
+| Variable               | Required | Description                                                  |
+| ---------------------- | -------- | ------------------------------------------------------------ |
+| `DISCORD_TOKEN`        | yes      | Bot token from the Developer Portal.                         |
+| `DEV_GUILD_ID`         | no       | Server ID for instant slash-command sync during development. |
+| `IDLE_TIMEOUT_SECONDS` | no       | Idle seconds before auto-disconnect (default `180`).         |
 
 ## Development
 
