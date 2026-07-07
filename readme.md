@@ -1,1 +1,85 @@
-A self-hostable discord music bot for easy streaming from certain sites.
+# a-discord-music-bot
+
+A self-hostable Discord music bot that streams audio into voice channels using
+**yt-dlp** + **ffmpeg**. Paste a URL from any yt-dlp-supported site, or search
+YouTube/SoundCloud and pick from the top 10 results in a dropdown.
+
+## Features
+
+- `/play` with direct URLs (YouTube, SoundCloud, Bandcamp, and [anything else yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md))
+- Search by name — shows a dropdown of the top 10 matches (YouTube by default, SoundCloud via the `source` option)
+- Per-server queue with add, view, skip, and fuzzy remove-by-name
+- Auto-disconnects after 3 minutes of inactivity (configurable)
+- Slash commands, no privileged intents required
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/play <query> [source]` | Play a URL, or search and pick from the top 10 results. Queues the track if something is already playing. |
+| `/pause` | Pause playback (stays connected). |
+| `/resume` | Resume paused playback. |
+| `/skip` | Skip the current track. If the queue is empty, disconnects. |
+| `/queue` | Show the current track and upcoming queue. |
+| `/remove <number or name>` | Remove a queued track by its `/queue` number or closest-matching name. |
+| `/stop` | Stop everything: clears the queue and disconnects. |
+
+## Setup
+
+### 1. Prerequisites
+
+- Python 3.10+
+- ffmpeg on your PATH:
+  - macOS: `brew install ffmpeg`
+  - Debian/Ubuntu: `sudo apt install ffmpeg`
+  - Windows: `winget install ffmpeg` (or [download](https://ffmpeg.org/download.html))
+
+### 2. Create the Discord application
+
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a **New Application**.
+2. Under **Bot**, click **Reset Token** and copy the token (you'll need it for `.env`). No privileged intents are needed.
+3. Invite the bot to your server with this URL (replace `YOUR_CLIENT_ID` with the Application ID from **General Information**):
+
+   ```
+   https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot%20applications.commands&permissions=3165184
+   ```
+
+   (That permission set is: View Channels, Send Messages, Embed Links, Connect, Speak.)
+
+### 3. Install and configure
+
+```sh
+git clone <this repo>
+cd a-discord-music-bot
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env        # then edit .env and paste your bot token
+```
+
+### 4. Run
+
+```sh
+python bot.py
+```
+
+Slash commands sync automatically on startup. Global sync can take up to an
+hour to show up in Discord — set `DEV_GUILD_ID` in `.env` to your server's ID
+for instant sync while testing.
+
+## Configuration (`.env`)
+
+| Variable | Required | Description |
+|---|---|---|
+| `DISCORD_TOKEN` | yes | Bot token from the Developer Portal. |
+| `DEV_GUILD_ID` | no | Server ID for instant slash-command sync during development. |
+| `IDLE_TIMEOUT_SECONDS` | no | Idle seconds before auto-disconnect (default `180`). |
+
+## Notes
+
+- The bot resolves stream URLs right before playback, so long-queued tracks
+  don't hit expired links.
+- Only the person who ran a search can pick from its dropdown; pickers time
+  out after 60 seconds.
+- Keep `yt-dlp` up to date (`pip install -U yt-dlp`) — sites change and old
+  versions stop working.
