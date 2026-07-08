@@ -74,17 +74,24 @@ for instant sync while testing.
 ### Run with Docker (alternative)
 
 Instead of steps 1 and 3–4 above, you can use the prebuilt image (ffmpeg
-included). You still need a bot token in `.env`.
+included).
 
-Easiest with Docker Compose:
+Easiest with Docker Compose — no clone needed. Put
+[`compose.yaml`](compose.yaml) and a `.env` (see [`.env.example`](.env.example))
+in a folder, paste your bot token into `.env`, then:
 
 ```sh
-docker compose up -d          # uses the prebuilt GHCR image
-docker compose up -d --build  # or build locally
+docker compose up -d          # pulls the prebuilt GHCR image
 docker compose logs -f        # follow logs
 ```
 
-Or plain `docker run`:
+If you've cloned the repo, you can build the image locally instead:
+
+```sh
+docker compose up -d --build
+```
+
+Or plain `docker run` (again with your token in `.env`):
 
 ```sh
 docker run --env-file .env ghcr.io/chaezuha/a-discord-music-bot:latest
