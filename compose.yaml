@@ -1,0 +1,6 @@
+services:
+  bot:
+    image: ghcr.io/chaezuha/a-discord-music-bot:latest
+    build: .
+    env_file: .env
+    restart: unless-stopped
