@@ -2,8 +2,6 @@
 
 [![CI](https://github.com/chaezuha/a-discord-music-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/chaezuha/a-discord-music-bot/actions/workflows/ci.yml)
 
-Note: This project is for educational and individual purposes
-
 A self-hostable Discord music bot that streams audio into voice channels using
 **yt-dlp** + **ffmpeg**. Paste a URL from any yt-dlp-supported site, or search
 YouTube/SoundCloud and pick from the top 10 results in a dropdown.
@@ -133,3 +131,18 @@ to GHCR.
   out after 60 seconds.
 - Keep `yt-dlp` up to date (`pip install -U yt-dlp`) — sites change and old
   versions stop working.
+
+## Disclaimer
+
+This project uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) to fetch audio
+streams for **personal, non-commercial playback only** — it does not
+download, cache, or redistribute media, and does not circumvent DRM.
+
+Streaming from YouTube via third-party tools may conflict with YouTube's
+Terms of Service. This is a self-hosted tool for private use in your own
+Discord server(s); the maintainer does not operate a public instance and is
+not affiliated with YouTube, SoundCloud, or Discord. You are responsible for
+complying with the ToS of any site you point this at, and for the copyright
+status of anything you play.
+
+Provided as-is, for educational purposes, with no warranty.
