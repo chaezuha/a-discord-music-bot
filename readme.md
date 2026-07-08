@@ -28,15 +28,7 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 
 ## Setup
 
-### 1. Prerequisites
-
-- Python 3.10+
-- ffmpeg on your PATH:
-  - macOS: `brew install ffmpeg`
-  - Debian/Ubuntu: `sudo apt install ffmpeg`
-  - Windows: `winget install ffmpeg` (or [download](https://ffmpeg.org/download.html))
-
-### 2. Create the Discord application
+### 1. Create the Discord application
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a **New Application**.
 2. Under **Bot**, click **Reset Token** and copy the token (you'll need it for `.env`). No privileged intents are needed.
@@ -48,39 +40,25 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 
    (That permission set is: View Channels, Send Messages, Embed Links, Connect, Speak.)
 
-### 3. Install and configure
+### 2. Run with Docker Compose (recommended)
 
-```sh
-git clone <this repo>
-cd a-discord-music-bot
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env        # then edit .env and paste your bot token
-```
-
-### 4. Run
-
-```sh
-python bot.py
-```
-
-Slash commands sync automatically on startup. Global sync can take up to an
-hour to show up in Discord — set `DEV_GUILD_ID` in `.env` to your server's ID
-for instant sync while testing.
-
-### Run with Docker (alternative)
-
-Instead of steps 1 and 3–4 above, you can use the prebuilt image (ffmpeg
-included).
-
-Easiest with Docker Compose — no clone needed. Put
-[`compose.yaml`](compose.yaml) and a `.env` (see [`.env.example`](.env.example))
-in a folder, paste your bot token into `.env`, then:
+No clone needed — the prebuilt image ships with ffmpeg and everything else
+included. Put [`compose.yaml`](compose.yaml) and a `.env` (see
+[`.env.example`](.env.example)) in a folder, paste your bot token into `.env`,
+then:
 
 ```sh
 docker compose up -d          # pulls the prebuilt GHCR image
 docker compose logs -f        # follow logs
+```
+
+The compose file sets `restart: unless-stopped`, so the bot comes back on its
+own after crashes and reboots.
+
+To update (this also refreshes yt-dlp, which goes stale as sites change):
+
+```sh
+docker compose pull && docker compose up -d
 ```
 
 If you've cloned the repo, you can build the image locally instead:
@@ -89,18 +67,48 @@ If you've cloned the repo, you can build the image locally instead:
 docker compose up -d --build
 ```
 
-Or plain `docker run` (again with your token in `.env`):
+### Alternative: plain Docker
+
+Same image, without Compose (again with your token in `.env`):
 
 ```sh
 docker run --env-file .env ghcr.io/chaezuha/a-discord-music-bot:latest
 ```
 
-Or build it yourself:
+Or build it yourself from a clone:
 
 ```sh
 docker build -t a-discord-music-bot .
 docker run --env-file .env a-discord-music-bot
 ```
+
+### Alternative: run directly with Python
+
+You'll need:
+
+- Python 3.10+
+- ffmpeg on your PATH:
+  - macOS: `brew install ffmpeg`
+  - Debian/Ubuntu: `sudo apt install ffmpeg`
+  - Windows: `winget install ffmpeg` (or [download](https://ffmpeg.org/download.html))
+
+Then install, configure, and run:
+
+```sh
+git clone <this repo>
+cd a-discord-music-bot
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env        # then edit .env and paste your bot token
+python bot.py
+```
+
+### Slash-command sync
+
+Whichever way you run it, slash commands sync automatically on startup. Global
+sync can take up to an hour to show up in Discord — set `DEV_GUILD_ID` in
+`.env` to your server's ID for instant sync while testing.
 
 ## Configuration (`.env`)
 
@@ -129,8 +137,9 @@ to GHCR.
   don't hit expired links.
 - Only the person who ran a search can pick from its dropdown; pickers time
   out after 60 seconds.
-- Keep `yt-dlp` up to date (`pip install -U yt-dlp`) — sites change and old
-  versions stop working.
+- Keep `yt-dlp` up to date — sites change and old versions stop working.
+  On Docker that's `docker compose pull`; on a Python install,
+  `pip install -U yt-dlp`.
 
 ## Disclaimer
 
