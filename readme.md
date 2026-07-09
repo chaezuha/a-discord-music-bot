@@ -55,16 +55,11 @@ docker compose logs -f        # follow logs
 The compose file sets `restart: unless-stopped`, so the bot comes back on its
 own after crashes and reboots.
 
-To update (this also refreshes yt-dlp, which goes stale as sites change):
+To update (this also refreshes yt-dlp, which goes stale as sites change),
+just run `up` again — the compose file pulls the latest image on every start:
 
 ```sh
-docker compose pull && docker compose up -d
-```
-
-If you've cloned the repo, you can build the image locally instead:
-
-```sh
-docker compose up -d --build
+docker compose up -d
 ```
 
 ### Alternative: plain Docker
@@ -138,7 +133,7 @@ to GHCR.
 - Only the person who ran a search can pick from its dropdown; pickers time
   out after 60 seconds.
 - Keep `yt-dlp` up to date — sites change and old versions stop working.
-  On Docker that's `docker compose pull`; on a Python install,
+  On Docker that's `docker compose up -d`; on a Python install,
   `pip install -U yt-dlp`.
 
 ## Disclaimer
