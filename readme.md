@@ -1,6 +1,6 @@
-# a-discord-music-bot
+# discord-music-bot
 
-[![CI](https://github.com/chaezuha/a-discord-music-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/chaezuha/a-discord-music-bot/actions/workflows/ci.yml)
+[![CI](https://github.com/chaezuha/discord-music-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/chaezuha/discord-music-bot/actions/workflows/ci.yml)
 
 A self-hostable Discord music bot that streams audio into voice channels using
 **yt-dlp** + **ffmpeg**. Paste a URL from any yt-dlp-supported site, or search
@@ -67,14 +67,14 @@ docker compose up -d
 Same image, without Compose (again with your token in `.env`):
 
 ```sh
-docker run --env-file .env ghcr.io/chaezuha/a-discord-music-bot:latest
+docker run --env-file .env ghcr.io/chaezuha/discord-music-bot:latest
 ```
 
 Or build it yourself from a clone:
 
 ```sh
-docker build -t a-discord-music-bot .
-docker run --env-file .env a-discord-music-bot
+docker build -t discord-music-bot .
+docker run --env-file .env discord-music-bot
 ```
 
 ### Alternative: run directly with Python
@@ -91,7 +91,7 @@ Then install, configure, and run:
 
 ```sh
 git clone <this repo>
-cd a-discord-music-bot
+cd discord-music-bot
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt

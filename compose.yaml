@@ -1,6 +1,6 @@
 services:
   bot:
-    image: ghcr.io/chaezuha/a-discord-music-bot:latest
+    image: ghcr.io/chaezuha/discord-music-bot:latest
     pull_policy: always
     env_file: .env
     restart: unless-stopped
