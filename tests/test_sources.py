@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 
 from musicbot import sources
-from musicbot.sources import SourceError, _clean_error, _first_entry, fmt_duration, is_url
+from musicbot.sources import (
+    SourceError,
+    _clean_error,
+    _first_entry,
+    fmt_duration,
+    fmt_title,
+    is_url,
+)
 
 
 def patch_extract(monkeypatch, result: dict):
@@ -43,6 +50,16 @@ def test_is_url():
 )
 def test_fmt_duration(seconds, expected):
     assert fmt_duration(seconds) == expected
+
+
+def test_fmt_title_links_to_webpage(track_factory):
+    track = track_factory("Song", webpage_url="https://example.com/song")
+    assert fmt_title(track) == "[**Song**](<https://example.com/song>)"
+
+
+def test_fmt_title_without_url_is_plain_bold(track_factory):
+    track = track_factory("Song", webpage_url="")
+    assert fmt_title(track) == "**Song**"
 
 
 def test_clean_error_strips_prefix():

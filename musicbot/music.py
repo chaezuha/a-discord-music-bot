@@ -13,7 +13,7 @@ from discord.ext import commands
 from . import sources
 from .notifier import BreakageNotifier
 from .player import GuildPlayer
-from .sources import SourceError, Track, fmt_duration, is_url
+from .sources import SourceError, Track, fmt_duration, fmt_title, is_url
 from .ui import SearchPicker
 
 log = logging.getLogger(__name__)
@@ -83,13 +83,13 @@ class Music(commands.Cog):
             if front:
                 return (
                     f"\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE WITH VERTICAL BAR} Playing next: "
-                    f"**{track.title}** ({fmt_duration(track.duration)})"
+                    f"{fmt_title(track)} ({fmt_duration(track.duration)})"
                 )
             return (
                 f"\N{HEAVY PLUS SIGN} Added to queue (#{position}): "
-                f"**{track.title}** ({fmt_duration(track.duration)})"
+                f"{fmt_title(track)} ({fmt_duration(track.duration)})"
             )
-        return f"\N{BLACK RIGHT-POINTING TRIANGLE} Queued **{track.title}** ({fmt_duration(track.duration)}) — starting now"
+        return f"\N{BLACK RIGHT-POINTING TRIANGLE} Queued {fmt_title(track)} ({fmt_duration(track.duration)}) — starting now"
 
     async def _on_pick(
         self, interaction: discord.Interaction, track: Track, front: bool = False
@@ -208,22 +208,22 @@ class Music(commands.Cog):
         player.resume()
         await interaction.response.send_message("\N{BLACK RIGHT-POINTING TRIANGLE} Resumed.")
 
-    @app_commands.command(description="Skip the current track (disconnects if the queue is empty)")
+    @app_commands.command(description="Skip the current track")
     @app_commands.guild_only()
     async def skip(self, interaction: discord.Interaction) -> None:
         player = self._player_or_error(interaction)
         if not player.is_active and not player.queue:
             raise UserError("Nothing is playing right now.")
+        player.skip()
         if player.queue:
-            player.skip()
             suffix = " (loop is still on — the next track will repeat)" if player.looping else ""
             await interaction.response.send_message(
                 f"\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE} Skipped.{suffix}"
             )
         else:
-            await player.destroy()
             await interaction.response.send_message(
-                "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE} Skipped — queue is empty, disconnecting."
+                "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE} Skipped — "
+                "the queue is empty, so playback stopped."
             )
 
     @app_commands.command(description="Show the current queue")
@@ -236,18 +236,20 @@ class Music(commands.Cog):
         lines = []
         if player.now_playing is not None:
             track = player.now_playing
-            loop_marker = (
+            marker = (
                 " \N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} (looping)"
                 if player.looping
                 else ""
             )
+            if player.voice.is_paused():
+                marker += " \N{DOUBLE VERTICAL BAR} (paused)"
             lines.append(
-                f"**Now playing:** {track.title} ({fmt_duration(track.duration)}){loop_marker} "
-                f"— requested by {track.requested_by}\n"
+                f"**Now playing:** {fmt_title(track)} ({self._fmt_progress(player, track)})"
+                f"{marker} — requested by {track.requested_by}\n"
             )
         for i, track in enumerate(list(player.queue)[:QUEUE_PAGE_SIZE], start=1):
             lines.append(
-                f"`{i}.` **{track.title}** ({fmt_duration(track.duration)}) — {track.requested_by}"
+                f"`{i}.` {fmt_title(track)} ({fmt_duration(track.duration)}) — {track.requested_by}"
             )
         remaining = len(player.queue) - QUEUE_PAGE_SIZE
         if remaining > 0:
@@ -259,6 +261,17 @@ class Music(commands.Cog):
             color=discord.Color.blurple(),
         )
         await interaction.response.send_message(embed=embed)
+
+    @staticmethod
+    def _fmt_progress(player: GuildPlayer, track: Track) -> str:
+        """`elapsed / total`, degrading to whichever half is known."""
+        position = player.position
+        if position is None:
+            return fmt_duration(track.duration)
+        elapsed = fmt_duration(position)
+        if track.duration:
+            return f"{elapsed} / {fmt_duration(track.duration)}"
+        return elapsed
 
     @app_commands.command(description="Toggle looping the current track (repeats until turned off)")
     @app_commands.guild_only()

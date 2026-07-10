@@ -49,6 +49,16 @@ def fmt_duration(seconds: float | None) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+def fmt_title(track: Track) -> str:
+    """Bold title, hyperlinked to the track's page when we have one.
+
+    The <> around the URL stops Discord from unfurling a preview embed.
+    """
+    if track.webpage_url:
+        return f"[**{track.title}**](<{track.webpage_url}>)"
+    return f"**{track.title}**"
+
+
 def _clean_error(exc: Exception) -> str:
     message = str(exc)
     if message.startswith("ERROR:"):

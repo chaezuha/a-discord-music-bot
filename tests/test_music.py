@@ -86,6 +86,29 @@ def test_enqueue_message_front_when_idle(track_factory):
     assert "starting now" in message
 
 
+def test_enqueue_message_links_title(track_factory):
+    message = Music._enqueue(None, StubPlayer(active=True, position=2), track_factory("Song"))
+    assert "[**Song**](<https://example.com/Song>)" in message
+
+
+# -- /queue progress --------------------------------------------------------
+
+
+def test_fmt_progress_shows_elapsed_and_total(track_factory):
+    player = SimpleNamespace(position=61.0)
+    assert Music._fmt_progress(player, track_factory(duration=180)) == "1:01 / 3:00"
+
+
+def test_fmt_progress_without_position_shows_total(track_factory):
+    player = SimpleNamespace(position=None)
+    assert Music._fmt_progress(player, track_factory(duration=180)) == "3:00"
+
+
+def test_fmt_progress_without_duration_shows_elapsed(track_factory):
+    player = SimpleNamespace(position=61.0)
+    assert Music._fmt_progress(player, track_factory(duration=None)) == "1:01"
+
+
 # -- /help ------------------------------------------------------------------
 
 

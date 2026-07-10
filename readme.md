@@ -25,9 +25,9 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 | `/playnext <query> [source]` | Like `/play`, but the track jumps to the front of the queue.                                            |
 | `/pause`                   | Pause playback (stays connected).                                                                         |
 | `/resume`                  | Resume paused playback.                                                                                   |
-| `/skip`                    | Skip the current track. If the queue is empty, disconnects.                                               |
+| `/skip`                    | Skip the current track (stays connected even if the queue is empty).                                      |
 | `/loop`                    | Repeat the current track until you run `/loop` again.                                                     |
-| `/queue`                   | Show the current track and upcoming queue.                                                                |
+| `/queue`                   | Show the current track (with elapsed time) and upcoming queue.                                            |
 | `/remove <number or name>` | Remove a queued track by its `/queue` number or closest-matching name.                                    |
 | `/stop`                    | Stop playback, clear the queue, and disconnect.                                                           |
 | `/help`                    | List all commands.                                                                                        |

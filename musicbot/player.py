@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from collections.abc import Callable
 
 import discord
 
 from .notifier import BreakageNotifier
-from .sources import SourceError, Track, fmt_duration, resolve_stream
+from .sources import SourceError, Track, fmt_duration, fmt_title, resolve_stream
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,8 @@ class GuildPlayer:
         self._notifier = notifier
         self._track_added = asyncio.Event()
         self._skip_requested = False
+        self._started_at: float | None = None
+        self._paused_at: float | None = None
         self._empty_task: asyncio.Task | None = None
         self._destroyed = False
         self._task = bot.loop.create_task(self._player_loop())
@@ -62,6 +65,15 @@ class GuildPlayer:
         """True while a track is playing, paused, or being resolved."""
         return self.now_playing is not None
 
+    @property
+    def position(self) -> float | None:
+        """Seconds into the current track, or None when nothing is playing."""
+        if self.now_playing is None or self._started_at is None:
+            return None
+        if self._paused_at is not None:
+            return self._paused_at - self._started_at
+        return time.monotonic() - self._started_at
+
     def skip(self) -> None:
         self._skip_requested = True
         self.voice.stop()
@@ -69,16 +81,19 @@ class GuildPlayer:
     def pause(self) -> None:
         self.auto_paused = False
         self.voice.pause()
+        self._mark_paused()
 
     def resume(self) -> None:
         self.auto_paused = False
         self.voice.resume()
+        self._mark_resumed()
 
     def channel_became_empty(self) -> None:
         """All humans left the voice channel: pause and start the leave timer."""
         if self.voice.is_playing():
             self.voice.pause()
             self.auto_paused = True
+            self._mark_paused()
         if self._empty_task is None or self._empty_task.done():
             self._empty_task = self.bot.loop.create_task(self._empty_channel_timer())
 
@@ -91,6 +106,16 @@ class GuildPlayer:
             self.auto_paused = False
             if self.voice.is_paused():
                 self.voice.resume()
+                self._mark_resumed()
+
+    def _mark_paused(self) -> None:
+        if self._paused_at is None:
+            self._paused_at = time.monotonic()
+
+    def _mark_resumed(self) -> None:
+        if self._paused_at is not None and self._started_at is not None:
+            self._started_at += time.monotonic() - self._paused_at
+        self._paused_at = None
 
     def remove_at(self, index: int) -> Track:
         track = self.queue[index]
@@ -165,9 +190,11 @@ class GuildPlayer:
                         options=FFMPEG_OPTIONS,
                     )
                     self.voice.play(source, after=_after)
+                    self._started_at = time.monotonic()
+                    self._paused_at = None
                     if not replay:
                         await self._say(
-                            f"\N{MULTIPLE MUSICAL NOTES} Now playing: **{track.title}** "
+                            f"\N{MULTIPLE MUSICAL NOTES} Now playing: {fmt_title(track)} "
                             f"({fmt_duration(track.duration)}) — requested by {track.requested_by}"
                         )
                     await finished.wait()
