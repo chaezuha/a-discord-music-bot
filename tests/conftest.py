@@ -10,12 +10,26 @@ from musicbot.player import GuildPlayer
 from musicbot.sources import Track
 
 
+class FakeUser:
+    def __init__(self) -> None:
+        self.dms: list[str] = []
+
+    async def send(self, content: str) -> None:
+        self.dms.append(content)
+
+
 class FakeBot:
-    """Just enough of discord.Client for GuildPlayer: an event loop."""
+    """Just enough of discord.Client for GuildPlayer: an event loop and DMs."""
+
+    def __init__(self) -> None:
+        self.owner = FakeUser()
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
         return asyncio.get_running_loop()
+
+    async def fetch_user(self, user_id: int) -> FakeUser:
+        return self.owner
 
 
 class FakeChannel:
@@ -109,6 +123,7 @@ async def make_player(voice, channel, monkeypatch):
         idle_timeout: float = 5.0,
         resolve=None,
         on_destroy=None,
+        notifier=None,
     ) -> tuple[GuildPlayer, list]:
         async def default_resolve(track: Track) -> str:
             return f"stream://{track.title}"
@@ -125,6 +140,7 @@ async def make_player(voice, channel, monkeypatch):
             text_channel=channel,
             idle_timeout=idle_timeout,
             on_destroy=on_destroy or (lambda: destroyed.append(True)),
+            notifier=notifier,
         )
         players.append(player)
         return player, destroyed

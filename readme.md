@@ -9,9 +9,12 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 ## Features
 
 - `/play` with direct URLs (YouTube, SoundCloud, Bandcamp, and [anything else yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md))
-- Search by name — shows a dropdown of the top 10 matches (YouTube by default, SoundCloud via the `source` option)
-- Per-server queue with add, view, skip, and fuzzy remove-by-name
-- Auto-disconnects after 3 minutes of inactivity (configurable)
+- Search by name and pick from a dropdown of the top 10 matches (YouTube by default, SoundCloud via the `source` option)
+- Per-server queue with add, view, skip, jump-the-queue (`/playnext`), and fuzzy remove-by-name
+- `/loop` to repeat the current track until you turn it off
+- Pauses itself when everyone leaves the voice channel and resumes when someone comes back
+- Auto-disconnects after 3 minutes of inactivity or an empty channel (configurable)
+- Can DM the bot owner when repeated failures suggest yt-dlp needs an update (set `OWNER_ID`)
 - Slash commands, no privileged intents required
 
 ## Commands
@@ -19,12 +22,15 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 | Command                    | What it does                                                                                              |
 | -------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `/play <query> [source]`   | Play a URL, or search and pick from the top 10 results. Queues the track if something is already playing. |
+| `/playnext <query> [source]` | Like `/play`, but the track jumps to the front of the queue.                                            |
 | `/pause`                   | Pause playback (stays connected).                                                                         |
 | `/resume`                  | Resume paused playback.                                                                                   |
 | `/skip`                    | Skip the current track. If the queue is empty, disconnects.                                               |
+| `/loop`                    | Repeat the current track until you run `/loop` again.                                                     |
 | `/queue`                   | Show the current track and upcoming queue.                                                                |
 | `/remove <number or name>` | Remove a queued track by its `/queue` number or closest-matching name.                                    |
-| `/stop`                    | Stop everything: clears the queue and disconnects.                                                        |
+| `/stop`                    | Stop playback, clear the queue, and disconnect.                                                           |
+| `/help`                    | List all commands.                                                                                        |
 
 ## Setup
 
@@ -42,8 +48,8 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 
 ### 2. Run with Docker Compose (recommended)
 
-No clone needed — the prebuilt image ships with ffmpeg and everything else
-included. Put [`compose.yaml`](compose.yaml) and a `.env` (see
+You don't need to clone the repo. The prebuilt image includes ffmpeg and
+everything else. Put [`compose.yaml`](compose.yaml) and a `.env` (see
 [`.env.example`](.env.example)) in a folder, paste your bot token into `.env`,
 then:
 
@@ -55,8 +61,8 @@ docker compose logs -f        # follow logs
 The compose file sets `restart: unless-stopped`, so the bot comes back on its
 own after crashes and reboots.
 
-To update (this also refreshes yt-dlp, which goes stale as sites change),
-just run `up` again — the compose file pulls the latest image on every start:
+To update, run `up` again. The compose file pulls the latest image on every
+start, which also picks up new yt-dlp releases:
 
 ```sh
 docker compose up -d
@@ -101,9 +107,9 @@ python bot.py
 
 ### Slash-command sync
 
-Whichever way you run it, slash commands sync automatically on startup. Global
-sync can take up to an hour to show up in Discord — set `DEV_GUILD_ID` in
-`.env` to your server's ID for instant sync while testing.
+Slash commands sync automatically on startup. A global sync can take up to an
+hour to show up in Discord, so set `DEV_GUILD_ID` in `.env` to your server's
+ID for instant sync while testing.
 
 ## Configuration (`.env`)
 
@@ -111,7 +117,8 @@ sync can take up to an hour to show up in Discord — set `DEV_GUILD_ID` in
 | ---------------------- | -------- | ------------------------------------------------------------ |
 | `DISCORD_TOKEN`        | yes      | Bot token from the Developer Portal.                         |
 | `DEV_GUILD_ID`         | no       | Server ID for instant slash-command sync during development. |
-| `IDLE_TIMEOUT_SECONDS` | no       | Idle seconds before auto-disconnect (default `180`).         |
+| `IDLE_TIMEOUT_SECONDS` | no       | Seconds before auto-disconnect, for both idle playback and an empty voice channel (default `180`). |
+| `OWNER_ID`             | no       | Your Discord user ID. If set, the bot DMs you when repeated failures suggest yt-dlp needs an update. |
 
 ## Development
 
@@ -132,14 +139,14 @@ to GHCR.
   don't hit expired links.
 - Only the person who ran a search can pick from its dropdown; pickers time
   out after 60 seconds.
-- Keep `yt-dlp` up to date — sites change and old versions stop working.
+- Keep `yt-dlp` up to date, since sites change and old versions stop working.
   On Docker that's `docker compose up -d`; on a Python install,
   `pip install -U yt-dlp`.
 
 ## Disclaimer
 
 This project uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) to fetch audio
-streams for **personal, non-commercial playback only** — it does not
+streams for **personal, non-commercial playback only**. It does not
 download, cache, or redistribute media, and does not circumvent DRM.
 
 Streaming from YouTube via third-party tools may conflict with YouTube's

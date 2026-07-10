@@ -28,8 +28,8 @@ class StubPlayer:
         self.is_active = active
         self._position = position
 
-    def enqueue(self, track) -> int:
-        return self._position
+    def enqueue(self, track, front: bool = False) -> int:
+        return 1 if front else self._position
 
 
 # -- /remove matching -----------------------------------------------------
@@ -69,3 +69,68 @@ def test_enqueue_message_when_idle(track_factory):
 def test_enqueue_message_when_busy(track_factory):
     message = Music._enqueue(None, StubPlayer(active=True, position=3), track_factory("Song"))
     assert "Added to queue (#3)" in message
+
+
+def test_enqueue_message_front(track_factory):
+    message = Music._enqueue(
+        None, StubPlayer(active=True, position=1), track_factory("Song"), front=True
+    )
+    assert "Playing next" in message
+    assert "Song" in message
+
+
+def test_enqueue_message_front_when_idle(track_factory):
+    message = Music._enqueue(
+        None, StubPlayer(active=False, position=1), track_factory("Song"), front=True
+    )
+    assert "starting now" in message
+
+
+# -- /help ------------------------------------------------------------------
+
+
+def test_help_embed_lists_all_commands():
+    cog = Music.__new__(Music)
+    embed = Music._help_embed(list(cog.get_app_commands()))
+    names = [field.name for field in embed.fields]
+    for expected in ("/help", "/loop", "/pause", "/playnext <query> [source]", "/queue"):
+        assert any(name.startswith(expected.split(" ")[0]) for name in names)
+    assert "/play <query> [source]" in names
+    assert "/playnext <query> [source]" in names
+    assert all(field.value for field in embed.fields)
+
+
+# -- voice channel occupancy ------------------------------------------------
+
+
+class OccupancyPlayer:
+    def __init__(self, members):
+        self.voice = SimpleNamespace(channel=SimpleNamespace(members=members))
+        self.calls: list[str] = []
+
+    def channel_became_empty(self):
+        self.calls.append("empty")
+
+    def channel_became_occupied(self):
+        self.calls.append("occupied")
+
+
+def test_occupancy_with_humans_resumes():
+    human = SimpleNamespace(bot=False)
+    bot_member = SimpleNamespace(bot=True)
+    player = OccupancyPlayer([bot_member, human])
+    Music._check_voice_occupancy(player)
+    assert player.calls == ["occupied"]
+
+
+def test_occupancy_only_bots_counts_as_empty():
+    player = OccupancyPlayer([SimpleNamespace(bot=True), SimpleNamespace(bot=True)])
+    Music._check_voice_occupancy(player)
+    assert player.calls == ["empty"]
+
+
+def test_occupancy_no_channel_is_noop():
+    player = OccupancyPlayer([])
+    player.voice.channel = None
+    Music._check_voice_occupancy(player)
+    assert player.calls == []
