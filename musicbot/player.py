@@ -37,7 +37,9 @@ class GuildPlayer:
         self.idle_timeout = idle_timeout
         self.queue: deque[Track] = deque()
         self.now_playing: Track | None = None
-        self.looping = False
+        self.song_looping = False
+        self.queue_looping = False
+        self.skip_votes: set[int] = set()
         self.auto_paused = False
         self._on_destroy = on_destroy
         self._notifier = notifier
@@ -162,6 +164,7 @@ class GuildPlayer:
                 while not self._destroyed:
                     self.now_playing = track
                     self._skip_requested = False
+                    self.skip_votes.clear()
                     try:
                         # Resolved on every replay too: stream URLs expire.
                         stream_url = await resolve_stream(track)
@@ -198,9 +201,11 @@ class GuildPlayer:
                             f"({fmt_duration(track.duration)}) — requested by {track.requested_by}"
                         )
                     await finished.wait()
-                    if self.looping and not self._skip_requested:
+                    if self.song_looping and not self._skip_requested:
                         replay = True
                         continue
+                    if self.queue_looping:
+                        self.queue.append(track)
                     self.now_playing = None
                     break
         except asyncio.CancelledError:

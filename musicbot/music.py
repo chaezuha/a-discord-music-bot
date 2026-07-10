@@ -30,6 +30,11 @@ class UserError(Exception):
     """A problem the user can fix; shown as-is in chat."""
 
 
+def votes_needed(listener_count: int) -> int:
+    """Votes required to pass a skip: half the listeners, rounded up (minimum 1)."""
+    return max(1, (listener_count + 1) // 2)
+
+
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -95,13 +100,15 @@ class Music(commands.Cog):
         self, interaction: discord.Interaction, track: Track, front: bool = False
     ) -> None:
         """Called by SearchPicker when the user selects a result."""
+        # Joining voice can outlast Discord's 3s ack deadline; ack the click first.
+        await interaction.response.defer()
         try:
             player = await self._ensure_player(interaction)
         except UserError as exc:
-            await interaction.response.edit_message(content=str(exc), view=None)
+            await interaction.edit_original_response(content=str(exc), view=None)
             return
         message = self._enqueue(player, track, front=front)
-        await interaction.response.edit_message(content=message, view=None)
+        await interaction.edit_original_response(content=message, view=None)
 
     async def _play_impl(
         self,
@@ -178,13 +185,15 @@ class Music(commands.Cog):
     @app_commands.guild_only()
     async def stop(self, interaction: discord.Interaction) -> None:
         player = self.players.get(interaction.guild_id)
+        if player is None and interaction.guild.voice_client is None:
+            raise UserError("I'm not connected to a voice channel.")
+        # Disconnecting can outlast Discord's 3s ack deadline; ack first.
+        await interaction.response.defer()
         if player is not None:
             await player.destroy()
-        elif interaction.guild.voice_client is not None:
-            await interaction.guild.voice_client.disconnect(force=True)
         else:
-            raise UserError("I'm not connected to a voice channel.")
-        await interaction.response.send_message(
+            await interaction.guild.voice_client.disconnect(force=True)
+        await interaction.followup.send(
             "\N{BLACK SQUARE FOR STOP} Stopped playback and cleared the queue. Bye!"
         )
 
@@ -208,23 +217,58 @@ class Music(commands.Cog):
         player.resume()
         await interaction.response.send_message("\N{BLACK RIGHT-POINTING TRIANGLE} Resumed.")
 
-    @app_commands.command(description="Skip the current track")
+    @app_commands.command(
+        description="Vote to skip the current track (majority of the voice channel)"
+    )
     @app_commands.guild_only()
     async def skip(self, interaction: discord.Interaction) -> None:
         player = self._player_or_error(interaction)
         if not player.is_active and not player.queue:
             raise UserError("Nothing is playing right now.")
-        player.skip()
-        if player.queue:
-            suffix = " (loop is still on — the next track will repeat)" if player.looping else ""
-            await interaction.response.send_message(
-                f"\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE} Skipped.{suffix}"
-            )
+        user = interaction.user
+        channel = player.voice.channel
+        if (
+            not isinstance(user, discord.Member)
+            or user.voice is None
+            or user.voice.channel != channel
+        ):
+            raise UserError("Join my voice channel to vote to skip.")
+
+        listeners = [m for m in channel.members if not m.bot]
+        needed = votes_needed(len(listeners))
+        player.skip_votes &= {m.id for m in listeners}
+        if user.id in player.skip_votes:
+            raise UserError(f"You already voted — {len(player.skip_votes)}/{needed} votes to skip.")
+        player.skip_votes.add(user.id)
+
+        if len(player.skip_votes) >= needed:
+            verb = "Vote passed — skipped" if needed > 1 else "Skipped"
+            await interaction.response.send_message(self._do_skip(player, verb))
         else:
             await interaction.response.send_message(
-                "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE} Skipped — "
-                "the queue is empty, so playback stopped."
+                f"Vote to skip: **{len(player.skip_votes)}/{needed}** — `/skip` to add your vote."
             )
+
+    @app_commands.command(description="Skip the current track immediately, no vote")
+    @app_commands.guild_only()
+    async def forceskip(self, interaction: discord.Interaction) -> None:
+        player = self._player_or_error(interaction)
+        if not player.is_active and not player.queue:
+            raise UserError("Nothing is playing right now.")
+        await interaction.response.send_message(self._do_skip(player, "Force-skipped"))
+
+    @staticmethod
+    def _do_skip(player: GuildPlayer, verb: str) -> str:
+        """Skip the current track; `verb` leads the confirmation message."""
+        player.skip()
+        prefix = f"\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE} {verb}"
+        if player.queue:
+            if player.song_looping:
+                return f"{prefix}. (song loop is still on — the next track will repeat)"
+            return f"{prefix}."
+        if player.queue_looping:
+            return f"{prefix} — queue loop is on, so it will come back around."
+        return f"{prefix} — the queue is empty, so playback stopped."
 
     @app_commands.command(description="Show the current queue")
     @app_commands.guild_only()
@@ -238,7 +282,7 @@ class Music(commands.Cog):
             track = player.now_playing
             marker = (
                 " \N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} (looping)"
-                if player.looping
+                if player.song_looping
                 else ""
             )
             if player.voice.is_paused():
@@ -260,6 +304,11 @@ class Music(commands.Cog):
             description="\n".join(lines),
             color=discord.Color.blurple(),
         )
+        if player.queue_looping:
+            embed.set_footer(
+                text="\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} "
+                "Queue loop is on — finished tracks return to the end."
+            )
         await interaction.response.send_message(embed=embed)
 
     @staticmethod
@@ -275,19 +324,41 @@ class Music(commands.Cog):
 
     @app_commands.command(description="Toggle looping the current track (repeats until turned off)")
     @app_commands.guild_only()
-    async def loop(self, interaction: discord.Interaction) -> None:
+    async def loopsong(self, interaction: discord.Interaction) -> None:
         player = self._player_or_error(interaction)
         if not player.is_active:
             raise UserError("Nothing is playing right now — start something with `/play` first.")
-        player.looping = not player.looping
-        if player.looping:
+        player.song_looping = not player.song_looping
+        if player.song_looping:
+            player.queue_looping = False
             await interaction.response.send_message(
                 f"\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Looping "
-                f"**{player.now_playing.title}** — run `/loop` again to turn it off."
+                f"**{player.now_playing.title}** — run `/loopsong` again to turn it off."
             )
         else:
             await interaction.response.send_message(
-                "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Loop off — "
+                "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Song loop off — "
+                "the queue will advance normally."
+            )
+
+    @app_commands.command(
+        description="Toggle looping the whole queue (finished tracks return to the end)"
+    )
+    @app_commands.guild_only()
+    async def loopqueue(self, interaction: discord.Interaction) -> None:
+        player = self._player_or_error(interaction)
+        if not player.is_active:
+            raise UserError("Nothing is playing right now — start something with `/play` first.")
+        player.queue_looping = not player.queue_looping
+        if player.queue_looping:
+            player.song_looping = False
+            await interaction.response.send_message(
+                "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Looping the queue — "
+                "finished tracks go back to the end. Run `/loopqueue` again to turn it off."
+            )
+        else:
+            await interaction.response.send_message(
+                "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Queue loop off — "
                 "the queue will advance normally."
             )
 

@@ -124,7 +124,7 @@ async def test_loop_replays_current_track(make_player, voice, channel, track_fac
     player.enqueue(track_factory("Song A"))
     await wait_until(lambda: voice.played_sources)
     player.enqueue(track_factory("Song B"))
-    player.looping = True
+    player.song_looping = True
 
     voice.finish_track()
     await wait_until(lambda: len(voice.played_sources) == 2)
@@ -143,7 +143,7 @@ async def test_loop_re_resolves_stream(make_player, voice, track_factory, wait_u
     player, _ = make_player(resolve=resolve)
     player.enqueue(track_factory("Song A"))
     await wait_until(lambda: voice.played_sources)
-    player.looping = True
+    player.song_looping = True
 
     voice.finish_track()
     await wait_until(lambda: len(voice.played_sources) == 2)
@@ -157,12 +157,12 @@ async def test_skip_while_looping_advances_and_keeps_loop(
     player.enqueue(track_factory("Song A"))
     await wait_until(lambda: voice.played_sources)
     player.enqueue(track_factory("Song B"))
-    player.looping = True
+    player.song_looping = True
 
     player.skip()
     await wait_until(lambda: len(voice.played_sources) == 2)
     assert voice.played_sources == ["stream://Song A", "stream://Song B"]
-    assert player.looping
+    assert player.song_looping
 
 
 async def test_loop_off_advances_normally(make_player, voice, track_factory, wait_until):
@@ -170,12 +170,93 @@ async def test_loop_off_advances_normally(make_player, voice, track_factory, wai
     player.enqueue(track_factory("Song A"))
     await wait_until(lambda: voice.played_sources)
     player.enqueue(track_factory("Song B"))
-    player.looping = True
-    player.looping = False
+    player.song_looping = True
+    player.song_looping = False
 
     voice.finish_track()
     await wait_until(lambda: len(voice.played_sources) == 2)
     assert voice.played_sources == ["stream://Song A", "stream://Song B"]
+
+
+async def test_queue_loop_reappends_finished_track(make_player, voice, track_factory, wait_until):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    player.queue_looping = True
+
+    voice.finish_track()
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert voice.played_sources == ["stream://Song A", "stream://Song B"]
+    assert [t.title for t in player.queue] == ["Song A"]
+
+
+async def test_queue_loop_reappends_skipped_track(make_player, voice, track_factory, wait_until):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    player.queue_looping = True
+
+    player.skip()
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert voice.played_sources == ["stream://Song A", "stream://Song B"]
+    assert [t.title for t in player.queue] == ["Song A"]
+
+
+async def test_queue_loop_single_track_cycles(make_player, voice, track_factory, wait_until):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.queue_looping = True
+
+    voice.finish_track()
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert voice.played_sources == ["stream://Song A", "stream://Song A"]
+
+
+async def test_queue_loop_does_not_reappend_failed_track(
+    make_player, voice, track_factory, wait_until
+):
+    async def resolve(track):
+        if track.title == "Broken":
+            raise SourceError("boom")
+        return f"stream://{track.title}"
+
+    player, _ = make_player(resolve=resolve)
+    player.queue_looping = True
+    player.enqueue(track_factory("Broken"))
+    player.enqueue(track_factory("Working"))
+
+    await wait_until(lambda: voice.played_sources)
+    assert voice.played_sources == ["stream://Working"]
+    assert [t.title for t in player.queue] == []
+
+
+async def test_song_loop_wins_over_queue_loop(make_player, voice, track_factory, wait_until):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    player.song_looping = True
+    player.queue_looping = True
+
+    voice.finish_track()
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert voice.played_sources == ["stream://Song A", "stream://Song A"]
+    assert [t.title for t in player.queue] == ["Song B"]
+
+
+async def test_skip_votes_reset_between_tracks(make_player, voice, track_factory, wait_until):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.skip_votes.add(123)
+    player.enqueue(track_factory("Song B"))
+
+    voice.finish_track()
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert player.skip_votes == set()
 
 
 async def test_channel_empty_auto_pauses_and_resumes(make_player, voice, track_factory, wait_until):

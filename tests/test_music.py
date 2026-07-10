@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from musicbot.music import Music
+from musicbot.music import Music, votes_needed
 
 
 @pytest.fixture
@@ -116,11 +116,31 @@ def test_help_embed_lists_all_commands():
     cog = Music.__new__(Music)
     embed = Music._help_embed(list(cog.get_app_commands()))
     names = [field.name for field in embed.fields]
-    for expected in ("/help", "/loop", "/pause", "/playnext <query> [source]", "/queue"):
+    for expected in (
+        "/help",
+        "/loopsong",
+        "/loopqueue",
+        "/forceskip",
+        "/skip",
+        "/pause",
+        "/playnext <query> [source]",
+        "/queue",
+    ):
         assert any(name.startswith(expected.split(" ")[0]) for name in names)
     assert "/play <query> [source]" in names
     assert "/playnext <query> [source]" in names
     assert all(field.value for field in embed.fields)
+
+
+# -- /skip vote threshold -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("listeners", "needed"),
+    [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 4)],
+)
+def test_votes_needed_is_half_rounded_up(listeners, needed):
+    assert votes_needed(listeners) == needed
 
 
 # -- voice channel occupancy ------------------------------------------------

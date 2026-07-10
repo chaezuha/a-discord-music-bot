@@ -11,7 +11,8 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 - `/play` with direct URLs (YouTube, SoundCloud, Bandcamp, and [anything else yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md))
 - Search by name and pick from a dropdown of the top 10 matches (YouTube by default, SoundCloud via the `source` option)
 - Per-server queue with add, view, skip, jump-the-queue (`/playnext`), and fuzzy remove-by-name
-- `/loop` to repeat the current track until you turn it off
+- Majority-vote skipping (`/skip`) with a no-vote escape hatch (`/forceskip`)
+- `/loopsong` to repeat the current track, `/loopqueue` to cycle the whole queue
 - Pauses itself when everyone leaves the voice channel and resumes when someone comes back
 - Auto-disconnects after 3 minutes of inactivity or an empty channel (configurable)
 - Can DM the bot owner when repeated failures suggest yt-dlp needs an update (set `OWNER_ID`)
@@ -25,8 +26,10 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 | `/playnext <query> [source]` | Like `/play`, but the track jumps to the front of the queue.                                            |
 | `/pause`                   | Pause playback (stays connected).                                                                         |
 | `/resume`                  | Resume paused playback.                                                                                   |
-| `/skip`                    | Skip the current track (stays connected even if the queue is empty).                                      |
-| `/loop`                    | Repeat the current track until you run `/loop` again.                                                     |
+| `/skip`                    | Vote to skip the current track — passes at half the voice channel, rounded up (instant with 1–2 listeners). |
+| `/forceskip`               | Skip the current track immediately, no vote.                                                              |
+| `/loopsong`                | Repeat the current track until you run `/loopsong` again.                                                  |
+| `/loopqueue`               | Loop the whole queue — finished tracks return to the end.                                                  |
 | `/queue`                   | Show the current track (with elapsed time) and upcoming queue.                                            |
 | `/remove <number or name>` | Remove a queued track by its `/queue` number or closest-matching name.                                    |
 | `/stop`                    | Stop playback, clear the queue, and disconnect.                                                           |
