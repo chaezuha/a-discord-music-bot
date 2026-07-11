@@ -7,6 +7,8 @@ import asyncio
 from musicbot.notifier import BreakageNotifier
 from musicbot.sources import SourceError
 
+from .conftest import fake_stream
+
 
 async def test_plays_enqueued_track(make_player, voice, channel, track_factory, wait_until):
     player, _ = make_player()
@@ -64,7 +66,7 @@ async def test_resolve_failure_skips_to_next(
     async def resolve(track):
         if track.title == "Broken":
             raise SourceError("boom")
-        return f"stream://{track.title}"
+        return fake_stream(track)
 
     player, _ = make_player(resolve=resolve)
     player.enqueue(track_factory("Broken"))
@@ -138,7 +140,7 @@ async def test_loop_re_resolves_stream(make_player, voice, track_factory, wait_u
 
     async def resolve(track):
         calls.append(track.title)
-        return f"stream://{track.title}"
+        return fake_stream(track)
 
     player, _ = make_player(resolve=resolve)
     player.enqueue(track_factory("Song A"))
@@ -221,7 +223,7 @@ async def test_queue_loop_does_not_reappend_failed_track(
     async def resolve(track):
         if track.title == "Broken":
             raise SourceError("boom")
-        return f"stream://{track.title}"
+        return fake_stream(track)
 
     player, _ = make_player(resolve=resolve)
     player.queue_looping = True
@@ -390,3 +392,130 @@ async def test_resolve_failure_notifies_owner(make_player, voice, track_factory,
 
     await wait_until(lambda: player.bot.owner.dms)
     assert "yt-dlp" in player.bot.owner.dms[0]
+
+
+async def test_skip_during_resolution_skips_track(make_player, voice, track_factory, wait_until):
+    gate = asyncio.Event()
+    resolving = asyncio.Event()
+
+    async def resolve(track):
+        if track.title == "Song A" and not gate.is_set():
+            resolving.set()
+            await gate.wait()
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    player.enqueue(track_factory("Song B"))
+
+    await resolving.wait()
+    player.skip()  # voice.stop() is a no-op here: nothing is playing yet
+    gate.set()
+
+    await wait_until(lambda: voice.played_sources)
+    assert voice.played_sources == ["stream://Song B"]
+
+
+async def test_skip_during_resolution_requeues_when_queue_looping(
+    make_player, voice, track_factory, wait_until
+):
+    gate = asyncio.Event()
+    resolving = asyncio.Event()
+
+    async def resolve(track):
+        if track.title == "Song A" and not gate.is_set():
+            resolving.set()
+            await gate.wait()
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.queue_looping = True
+    player.enqueue(track_factory("Song A"))
+    player.enqueue(track_factory("Song B"))
+
+    await resolving.wait()
+    player.skip()
+    gate.set()
+
+    await wait_until(lambda: voice.played_sources)
+    assert voice.played_sources == ["stream://Song B"]
+    assert [t.title for t in player.queue] == ["Song A"]
+
+
+async def test_playback_error_notifies_and_does_not_requeue(
+    make_player, voice, channel, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.queue_looping = True
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+
+    voice.finish_track(error=RuntimeError("ffmpeg exploded"))
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert voice.played_sources[1] == "stream://Song B"
+    assert any("failed" in m and "ffmpeg exploded" in m for m in channel.messages)
+    # The broken track must not come back around via the queue loop.
+    assert [t.title for t in player.queue] == []
+
+
+async def test_playback_error_stops_song_loop(
+    make_player, voice, channel, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.song_looping = True
+
+    voice.finish_track(error=RuntimeError("boom"))
+    await wait_until(lambda: player.now_playing is None)
+    assert voice.played_sources == ["stream://Song A"]
+    assert any("failed" in m for m in channel.messages)
+
+
+async def test_play_exception_skips_track_but_keeps_player(
+    make_player, voice, channel, track_factory, wait_until
+):
+    voice.play_error = RuntimeError("ffmpeg binary missing")
+    player, destroyed = make_player()
+    player.enqueue(track_factory("Song A"))
+    player.enqueue(track_factory("Song B"))
+
+    await wait_until(lambda: voice.played_sources)
+    assert voice.played_sources == ["stream://Song B"]
+    assert any("Couldn't play" in m and "Song A" in m for m in channel.messages)
+    assert destroyed == []
+
+
+async def test_instant_finish_of_long_track_counts_as_failure(
+    make_player, voice, channel, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.queue_looping = True
+    player.enqueue(track_factory("Song A", duration=180))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track()  # dead stream URL: ffmpeg exits instantly, no error
+    await wait_until(lambda: player.now_playing is None)
+    assert any("failed" in m for m in channel.messages)
+    assert [t.title for t in player.queue] == []
+
+
+async def test_prefetch_resolves_next_track_while_playing(
+    make_player, voice, track_factory, wait_until
+):
+    calls = []
+
+    async def resolve(track):
+        calls.append(track.title)
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    player.enqueue(track_factory("Song B"))
+    await wait_until(lambda: "Song B" in calls)
+    # Song B was resolved while Song A is still playing.
+    assert voice.played_sources == ["stream://Song A"]
+    assert player.now_playing.title == "Song A"

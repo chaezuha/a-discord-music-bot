@@ -16,7 +16,13 @@ log = logging.getLogger("bot")
 class MusicBot(commands.Bot):
     def __init__(self, dev_guild_id: int | None):
         intents = discord.Intents.default()
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            # User-supplied text (queries, titles, names) is echoed back;
+            # never let it ping anyone.
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         self.dev_guild_id = dev_guild_id
 
     async def setup_hook(self) -> None:

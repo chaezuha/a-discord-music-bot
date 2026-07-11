@@ -62,6 +62,11 @@ def test_fmt_title_without_url_is_plain_bold(track_factory):
     assert fmt_title(track) == "**Song**"
 
 
+def test_fmt_title_escapes_markdown(track_factory):
+    track = track_factory("**evil** [link](x)", webpage_url="")
+    assert fmt_title(track) == r"**\*\*evil\*\* \[link](x)**"
+
+
 def test_clean_error_strips_prefix():
     assert _clean_error(Exception("ERROR: video unavailable")) == "video unavailable"
     assert _clean_error(Exception("plain message")) == "plain message"
@@ -150,8 +155,10 @@ async def test_fetch_track_empty_playlist_raises(monkeypatch):
 
 
 async def test_resolve_stream_uses_top_level_url(monkeypatch, track_factory):
-    patch_extract(monkeypatch, {"url": "https://stream", "formats": []})
-    assert await sources.resolve_stream(track_factory()) == "https://stream"
+    patch_extract(monkeypatch, {"url": "https://stream", "acodec": "opus", "formats": []})
+    resolved = await sources.resolve_stream(track_factory())
+    assert resolved.url == "https://stream"
+    assert resolved.acodec == "opus"
 
 
 async def test_resolve_stream_falls_back_to_last_audio_format(monkeypatch, track_factory):
@@ -166,10 +173,52 @@ async def test_resolve_stream_falls_back_to_last_audio_format(monkeypatch, track
             ]
         },
     )
-    assert await sources.resolve_stream(track_factory()) == "https://f2"
+    resolved = await sources.resolve_stream(track_factory())
+    assert resolved.url == "https://f2"
+    assert resolved.acodec == "mp4a"
 
 
 async def test_resolve_stream_no_audio_raises(monkeypatch, track_factory):
     patch_extract(monkeypatch, {"formats": [{"url": "https://video", "acodec": "none"}]})
     with pytest.raises(SourceError):
         await sources.resolve_stream(track_factory())
+
+
+async def test_resolve_stream_reuses_fresh_cache(monkeypatch, track_factory):
+    calls = patch_extract(monkeypatch, {"url": "https://stream", "acodec": "opus"})
+    track = track_factory()
+    first = await sources.resolve_stream(track)
+    second = await sources.resolve_stream(track)
+    assert len(calls) == 1
+    assert second is first
+
+
+async def test_resolve_stream_re_extracts_stale_cache(monkeypatch, track_factory):
+    calls = patch_extract(monkeypatch, {"url": "https://stream", "acodec": "opus"})
+    track = track_factory()
+    first = await sources.resolve_stream(track)
+    track.stream.resolved_at -= sources.STREAM_TTL_SECONDS + 1
+    second = await sources.resolve_stream(track)
+    assert len(calls) == 2
+    assert second is not first
+
+
+async def test_fetch_track_prepopulates_stream_cache(monkeypatch):
+    calls = patch_extract(
+        monkeypatch,
+        {
+            "title": "Song",
+            "webpage_url": "https://w",
+            "duration": 42,
+            "uploader": "U",
+            "url": "https://stream",
+            "acodec": "opus",
+        },
+    )
+    track = await sources.fetch_track("https://w", requested_by="me")
+    assert track.stream is not None
+    assert track.stream.url == "https://stream"
+    # Playback's resolve should now be free.
+    resolved = await sources.resolve_stream(track)
+    assert resolved is track.stream
+    assert len(calls) == 1

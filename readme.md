@@ -35,6 +35,10 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 | `/stop`                    | Stop playback, clear the queue, and disconnect.                                                           |
 | `/help`                    | List all commands.                                                                                        |
 
+Control commands (`/pause`, `/resume`, `/skip`, `/forceskip`, `/loopsong`,
+`/loopqueue`, `/remove`, `/stop`) only work while you're in the bot's voice
+channel; `/queue` and `/help` are open to everyone.
+
 ## Setup
 
 ### 1. Create the Discord application

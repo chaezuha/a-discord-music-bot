@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
 from musicbot.player import GuildPlayer
-from musicbot.sources import Track
+from musicbot.sources import ResolvedStream, Track
+
+
+def fake_stream(track: Track) -> ResolvedStream:
+    return ResolvedStream(
+        url=f"stream://{track.title}", acodec="opus", resolved_at=time.monotonic()
+    )
 
 
 class FakeUser:
@@ -50,6 +57,7 @@ class FakeVoiceClient:
         self.played_sources: list[str] = []
         self.stop_calls = 0
         self.disconnect_calls = 0
+        self.play_error: Exception | None = None
         self._after = None
 
     def is_connected(self) -> bool:
@@ -62,6 +70,9 @@ class FakeVoiceClient:
         return self.paused
 
     def play(self, source, *, after=None) -> None:
+        if self.play_error is not None:
+            error, self.play_error = self.play_error, None
+            raise error
         self.playing = True
         self._after = after
         self.played_sources.append(source)
@@ -94,7 +105,9 @@ def track_factory():
     def make(title: str = "Test Song", **overrides) -> Track:
         fields = {
             "webpage_url": f"https://example.com/{title.replace(' ', '-')}",
-            "duration": 180,
+            # Short enough that instantly-finishing fake playback isn't
+            # mistaken for a dead stream (see SUSPICIOUS_MIN_DURATION).
+            "duration": 5,
             "uploader": "Test Uploader",
             "requested_by": "tester",
         }
@@ -125,12 +138,12 @@ async def make_player(voice, channel, monkeypatch):
         on_destroy=None,
         notifier=None,
     ) -> tuple[GuildPlayer, list]:
-        async def default_resolve(track: Track) -> str:
-            return f"stream://{track.title}"
+        async def default_resolve(track: Track) -> ResolvedStream:
+            return fake_stream(track)
 
         monkeypatch.setattr("musicbot.player.resolve_stream", resolve or default_resolve)
         monkeypatch.setattr(
-            "musicbot.player.discord.FFmpegPCMAudio",
+            "musicbot.player.discord.FFmpegOpusAudio",
             lambda url, **kwargs: url,
         )
         destroyed: list[bool] = []

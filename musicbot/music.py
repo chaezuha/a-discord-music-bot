@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import logging
 import os
@@ -19,6 +20,8 @@ from .ui import SearchPicker
 log = logging.getLogger(__name__)
 
 QUEUE_PAGE_SIZE = 15
+
+esc = discord.utils.escape_markdown
 
 SOURCE_CHOICES = [
     app_commands.Choice(name="YouTube", value="youtube"),
@@ -39,6 +42,7 @@ class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.players: dict[int, GuildPlayer] = {}
+        self._player_locks: dict[int, asyncio.Lock] = {}
         self.idle_timeout = float(os.getenv("IDLE_TIMEOUT_SECONDS") or 180)
         owner_raw = (os.getenv("OWNER_ID") or "").strip()
         self.notifier = BreakageNotifier(int(owner_raw) if owner_raw else None)
@@ -51,35 +55,55 @@ class Music(commands.Cog):
         if not isinstance(user, discord.Member) or user.voice is None or user.voice.channel is None:
             raise UserError("Join a voice channel first, then try again.")
         channel = user.voice.channel
+        guild_id = interaction.guild_id
 
-        player = self.players.get(interaction.guild_id)
-        if player is not None:
-            if player.voice.channel != channel:
-                if player.is_active:
-                    raise UserError(
-                        f"I'm already playing in {player.voice.channel.mention} — join me there."
-                    )
-                await player.voice.move_to(channel)
+        # Serialized per guild: concurrent /play calls must not double-connect,
+        # and a player mid-/stop must not receive new tracks.
+        lock = self._player_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            player = self.players.get(guild_id)
+            if player is not None and player.destroyed:
+                # destroy() is in flight; its removal callback hasn't run yet.
+                self._remove_player(guild_id, player)
+                player = None
+            if player is not None:
+                if player.voice.channel != channel:
+                    if player.is_active:
+                        raise UserError(
+                            f"I'm already playing in {player.voice.channel.mention} — join me there."
+                        )
+                    await player.voice.move_to(channel)
+                return player
+
+            voice = await channel.connect(self_deaf=True)
+            player = GuildPlayer(
+                bot=self.bot,
+                voice=voice,
+                text_channel=interaction.channel,
+                idle_timeout=self.idle_timeout,
+                on_destroy=lambda: self._remove_player(guild_id, player),
+                notifier=self.notifier,
+            )
+            self.players[guild_id] = player
             return player
 
-        voice = await channel.connect(self_deaf=True)
-        guild_id = interaction.guild_id
-        player = GuildPlayer(
-            bot=self.bot,
-            voice=voice,
-            text_channel=interaction.channel,
-            idle_timeout=self.idle_timeout,
-            on_destroy=lambda: self.players.pop(guild_id, None),
-            notifier=self.notifier,
-        )
-        self.players[guild_id] = player
-        return player
+    def _remove_player(self, guild_id: int, player: GuildPlayer) -> None:
+        """Drop the guild's player, but only if it's still this instance."""
+        if self.players.get(guild_id) is player:
+            del self.players[guild_id]
 
     def _player_or_error(self, interaction: discord.Interaction) -> GuildPlayer:
         player = self.players.get(interaction.guild_id)
         if player is None:
             raise UserError("I'm not connected to a voice channel right now.")
         return player
+
+    @staticmethod
+    def _require_same_channel(interaction: discord.Interaction, player: GuildPlayer) -> None:
+        """Control commands are limited to people in the bot's voice channel."""
+        voice = getattr(interaction.user, "voice", None)
+        if voice is None or voice.channel != player.voice.channel:
+            raise UserError("Join my voice channel to use that command.")
 
     def _enqueue(self, player: GuildPlayer, track: Track, front: bool = False) -> str:
         was_active = player.is_active
@@ -135,7 +159,7 @@ class Music(commands.Cog):
         source_key = source.value if source else "youtube"
         tracks = await sources.search(query, source_key, requested_by=requested_by)
         if not tracks:
-            await interaction.followup.send(f"No results found for **{query}**.")
+            await interaction.followup.send(f"No results found for **{esc(query)}**.")
             return
 
         async def on_pick(pick_interaction: discord.Interaction, track: Track) -> None:
@@ -143,7 +167,7 @@ class Music(commands.Cog):
 
         view = SearchPicker(tracks, interaction.user, on_pick)
         view.message = await interaction.followup.send(
-            f"\N{LEFT-POINTING MAGNIFYING GLASS} Top results for **{query}** — pick one:",
+            f"\N{LEFT-POINTING MAGNIFYING GLASS} Top results for **{esc(query)}** — pick one:",
             view=view,
         )
 
@@ -187,6 +211,8 @@ class Music(commands.Cog):
         player = self.players.get(interaction.guild_id)
         if player is None and interaction.guild.voice_client is None:
             raise UserError("I'm not connected to a voice channel.")
+        if player is not None:
+            self._require_same_channel(interaction, player)
         # Disconnecting can outlast Discord's 3s ack deadline; ack first.
         await interaction.response.defer()
         if player is not None:
@@ -201,6 +227,7 @@ class Music(commands.Cog):
     @app_commands.guild_only()
     async def pause(self, interaction: discord.Interaction) -> None:
         player = self._player_or_error(interaction)
+        self._require_same_channel(interaction, player)
         if player.voice.is_paused():
             raise UserError("Playback is already paused. Use `/resume` to continue.")
         if not player.voice.is_playing():
@@ -212,6 +239,7 @@ class Music(commands.Cog):
     @app_commands.guild_only()
     async def resume(self, interaction: discord.Interaction) -> None:
         player = self._player_or_error(interaction)
+        self._require_same_channel(interaction, player)
         if not player.voice.is_paused():
             raise UserError("Nothing is paused right now.")
         player.resume()
@@ -253,6 +281,7 @@ class Music(commands.Cog):
     @app_commands.guild_only()
     async def forceskip(self, interaction: discord.Interaction) -> None:
         player = self._player_or_error(interaction)
+        self._require_same_channel(interaction, player)
         if not player.is_active and not player.queue:
             raise UserError("Nothing is playing right now.")
         await interaction.response.send_message(self._do_skip(player, "Force-skipped"))
@@ -326,6 +355,7 @@ class Music(commands.Cog):
     @app_commands.guild_only()
     async def loopsong(self, interaction: discord.Interaction) -> None:
         player = self._player_or_error(interaction)
+        self._require_same_channel(interaction, player)
         if not player.is_active:
             raise UserError("Nothing is playing right now — start something with `/play` first.")
         player.song_looping = not player.song_looping
@@ -333,7 +363,7 @@ class Music(commands.Cog):
             player.queue_looping = False
             await interaction.response.send_message(
                 f"\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Looping "
-                f"**{player.now_playing.title}** — run `/loopsong` again to turn it off."
+                f"**{esc(player.now_playing.title)}** — run `/loopsong` again to turn it off."
             )
         else:
             await interaction.response.send_message(
@@ -347,6 +377,7 @@ class Music(commands.Cog):
     @app_commands.guild_only()
     async def loopqueue(self, interaction: discord.Interaction) -> None:
         player = self._player_or_error(interaction)
+        self._require_same_channel(interaction, player)
         if not player.is_active:
             raise UserError("Nothing is playing right now — start something with `/play` first.")
         player.queue_looping = not player.queue_looping
@@ -389,13 +420,14 @@ class Music(commands.Cog):
         player = self.players.get(interaction.guild_id)
         if player is None or not player.queue:
             raise UserError("The queue is empty — nothing to remove.")
+        self._require_same_channel(interaction, player)
 
         index = self._find_queue_index(player, target.strip())
         if index is None:
-            raise UserError(f"Couldn't find anything in the queue matching **{target}**.")
+            raise UserError(f"Couldn't find anything in the queue matching **{esc(target)}**.")
         track = player.remove_at(index)
         await interaction.response.send_message(
-            f"\N{WASTEBASKET} Removed #{index + 1}: **{track.title}**"
+            f"\N{WASTEBASKET} Removed #{index + 1}: **{esc(track.title)}**"
         )
 
     @staticmethod

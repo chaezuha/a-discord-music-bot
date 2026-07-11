@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from musicbot.music import Music, votes_needed
+from musicbot.music import Music, UserError, votes_needed
 
 
 @pytest.fixture
@@ -177,3 +177,49 @@ def test_occupancy_no_channel_is_noop():
     player.voice.channel = None
     Music._check_voice_occupancy(player)
     assert player.calls == []
+
+
+# -- player bookkeeping -------------------------------------------------------
+
+
+def test_remove_player_only_removes_matching_instance():
+    cog = Music.__new__(Music)
+    old_player, new_player = object(), object()
+    cog.players = {1: new_player}
+
+    # A stale destroy callback from the old player must not evict the new one.
+    cog._remove_player(1, old_player)
+    assert cog.players[1] is new_player
+
+    cog._remove_player(1, new_player)
+    assert 1 not in cog.players
+
+
+# -- voice channel gate -------------------------------------------------------
+
+
+def _gate_fixtures():
+    bot_channel = SimpleNamespace(name="music")
+    player = SimpleNamespace(voice=SimpleNamespace(channel=bot_channel))
+    return bot_channel, player
+
+
+def test_same_channel_gate_allows_member_in_channel():
+    bot_channel, player = _gate_fixtures()
+    interaction = SimpleNamespace(user=SimpleNamespace(voice=SimpleNamespace(channel=bot_channel)))
+    Music._require_same_channel(interaction, player)  # must not raise
+
+
+def test_same_channel_gate_rejects_member_elsewhere():
+    _, player = _gate_fixtures()
+    other = SimpleNamespace(name="afk")
+    interaction = SimpleNamespace(user=SimpleNamespace(voice=SimpleNamespace(channel=other)))
+    with pytest.raises(UserError):
+        Music._require_same_channel(interaction, player)
+
+
+def test_same_channel_gate_rejects_user_not_in_voice():
+    _, player = _gate_fixtures()
+    interaction = SimpleNamespace(user=SimpleNamespace(voice=None))
+    with pytest.raises(UserError):
+        Music._require_same_channel(interaction, player)

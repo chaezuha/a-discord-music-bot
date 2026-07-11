@@ -18,6 +18,12 @@ log = logging.getLogger(__name__)
 FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
 
+# A track that "finishes" this fast (while claiming to be much longer) almost
+# certainly hit a dead stream URL: ffmpeg exits on HTTP errors without
+# reporting a playback error, so we detect it by elapsed time.
+SUSPICIOUS_FINISH_SECONDS = 2.0
+SUSPICIOUS_MIN_DURATION = 10
+
 
 class GuildPlayer:
     """Owns the queue, voice client, and playback loop for one guild."""
@@ -48,6 +54,7 @@ class GuildPlayer:
         self._started_at: float | None = None
         self._paused_at: float | None = None
         self._empty_task: asyncio.Task | None = None
+        self._prefetch_task: asyncio.Task | None = None
         self._destroyed = False
         self._task = bot.loop.create_task(self._player_loop())
 
@@ -60,12 +67,18 @@ class GuildPlayer:
         else:
             self.queue.append(track)
         self._track_added.set()
+        if self.now_playing is not None and self.queue[0] is track:
+            self._prefetch_next()
         return 1 if front else len(self.queue)
 
     @property
     def is_active(self) -> bool:
         """True while a track is playing, paused, or being resolved."""
         return self.now_playing is not None
+
+    @property
+    def destroyed(self) -> bool:
+        return self._destroyed
 
     @property
     def position(self) -> float | None:
@@ -135,6 +148,8 @@ class GuildPlayer:
             self._task.cancel()
         if self._empty_task is not None and self._empty_task is not asyncio.current_task():
             self._empty_task.cancel()
+        if self._prefetch_task is not None:
+            self._prefetch_task.cancel()
         try:
             self.voice.stop()
             if self.voice.is_connected():
@@ -166,41 +181,75 @@ class GuildPlayer:
                     self._skip_requested = False
                     self.skip_votes.clear()
                     try:
-                        # Resolved on every replay too: stream URLs expire.
-                        stream_url = await resolve_stream(track)
+                        # Re-checked on every replay too; cached results are
+                        # reused while fresh, re-extracted once they expire.
+                        resolved = await resolve_stream(track)
                     except SourceError as exc:
                         if self._notifier is not None:
                             await self._notifier.record_failure(self.bot)
-                        await self._say(f"\N{WARNING SIGN} Skipping **{track.title}**: {exc}")
+                        await self._say(f"\N{WARNING SIGN} Skipping {fmt_title(track)}: {exc}")
                         self.now_playing = None
                         break
                     if self._notifier is not None:
                         self._notifier.record_success()
 
+                    if self._skip_requested:
+                        # Skipped while resolving: voice.stop() had nothing to
+                        # stop, so honor the skip here instead of playing.
+                        if self.queue_looping:
+                            self.queue.append(track)
+                        self.now_playing = None
+                        break
+
                     if self._destroyed or not self.voice.is_connected():
                         break
 
                     finished = asyncio.Event()
+                    error_slot: list[Exception | None] = [None]
 
-                    def _after(error: Exception | None, finished: asyncio.Event = finished) -> None:
+                    def _after(
+                        error: Exception | None,
+                        finished: asyncio.Event = finished,
+                        error_slot: list[Exception | None] = error_slot,
+                    ) -> None:
                         if error:
+                            error_slot[0] = error
                             log.error("Playback error: %s", error)
                         self.bot.loop.call_soon_threadsafe(finished.set)
 
-                    source = discord.FFmpegPCMAudio(
-                        stream_url,
-                        before_options=FFMPEG_BEFORE_OPTIONS,
-                        options=FFMPEG_OPTIONS,
-                    )
-                    self.voice.play(source, after=_after)
+                    try:
+                        # Opus streams are remuxed as-is; anything else is
+                        # transcoded by ffmpeg instead of the PCM pipeline.
+                        source = discord.FFmpegOpusAudio(
+                            resolved.url,
+                            codec="copy" if resolved.acodec == "opus" else "libopus",
+                            before_options=FFMPEG_BEFORE_OPTIONS,
+                            options=FFMPEG_OPTIONS,
+                        )
+                        self.voice.play(source, after=_after)
+                    except Exception as exc:
+                        log.exception("Could not start playback")
+                        track.stream = None
+                        await self._say(f"\N{WARNING SIGN} Couldn't play {fmt_title(track)}: {exc}")
+                        self.now_playing = None
+                        break
                     self._started_at = time.monotonic()
                     self._paused_at = None
+                    self._prefetch_next()
                     if not replay:
                         await self._say(
                             f"\N{MULTIPLE MUSICAL NOTES} Now playing: {fmt_title(track)} "
                             f"({fmt_duration(track.duration)}) — requested by {track.requested_by}"
                         )
                     await finished.wait()
+                    if self._playback_failed(track, error_slot[0]):
+                        track.stream = None
+                        reason = str(error_slot[0]) if error_slot[0] else "the stream cut out"
+                        await self._say(
+                            f"\N{WARNING SIGN} Playback of {fmt_title(track)} failed: {reason}"
+                        )
+                        self.now_playing = None
+                        break
                     if self.song_looping and not self._skip_requested:
                         replay = True
                         continue
@@ -215,6 +264,42 @@ class GuildPlayer:
         finally:
             if not self._destroyed:
                 await self.destroy()
+
+    def _playback_failed(self, track: Track, error: Exception | None) -> bool:
+        """Whether the track's end should be treated as a playback failure.
+
+        ffmpeg exits silently (no error) on dead/expired stream URLs, so an
+        implausibly early finish counts as a failure too.
+        """
+        if self._destroyed or self._skip_requested:
+            return False
+        if error is not None:
+            return True
+        position = self.position
+        return (
+            position is not None
+            and position < SUSPICIOUS_FINISH_SECONDS
+            and (track.duration or 0) >= SUSPICIOUS_MIN_DURATION
+        )
+
+    def _prefetch_next(self) -> None:
+        """Resolve the upcoming track's stream while the current one plays."""
+        if self._prefetch_task is not None:
+            self._prefetch_task.cancel()
+            self._prefetch_task = None
+        if not self.queue:
+            return
+        next_track = self.queue[0]
+
+        async def prefetch() -> None:
+            try:
+                await resolve_stream(next_track)
+            except SourceError:
+                pass  # the resolve at play time reports the failure
+            except Exception:
+                log.exception("Prefetch failed")
+
+        self._prefetch_task = self.bot.loop.create_task(prefetch())
 
     async def _empty_channel_timer(self) -> None:
         try:

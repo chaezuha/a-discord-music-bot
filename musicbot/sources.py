@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
+import discord
 import yt_dlp
 
 SEARCH_PREFIXES = {
@@ -20,9 +22,20 @@ _BASE_OPTS = {
     "socket_timeout": 15,
 }
 
+# Resolved stream URLs are reused within this window. YouTube URLs last ~6h;
+# staying well under that keeps loops and prefetches safe.
+STREAM_TTL_SECONDS = 15 * 60
+
 
 class SourceError(Exception):
     """Extraction failed in a way worth showing to the user."""
+
+
+@dataclass
+class ResolvedStream:
+    url: str
+    acodec: str | None
+    resolved_at: float
 
 
 @dataclass
@@ -32,6 +45,7 @@ class Track:
     duration: int | None
     uploader: str
     requested_by: str
+    stream: ResolvedStream | None = field(default=None, compare=False)
 
 
 def is_url(text: str) -> bool:
@@ -54,9 +68,10 @@ def fmt_title(track: Track) -> str:
 
     The <> around the URL stops Discord from unfurling a preview embed.
     """
+    title = discord.utils.escape_markdown(track.title)
     if track.webpage_url:
-        return f"[**{track.title}**](<{track.webpage_url}>)"
-    return f"**{track.title}**"
+        return f"[**{title}**](<{track.webpage_url}>)"
+    return f"**{title}**"
 
 
 def _clean_error(exc: Exception) -> str:
@@ -100,6 +115,21 @@ def _track_from_entry(entry: dict, requested_by: str) -> Track:
     )
 
 
+def _stream_from_info(info: dict) -> ResolvedStream:
+    """Pick the playable audio URL (and its codec) out of a full extraction."""
+    url = info.get("url")
+    acodec = info.get("acodec")
+    if not url:
+        for fmt in reversed(info.get("formats") or []):
+            if fmt.get("url") and fmt.get("acodec") not in (None, "none"):
+                url = fmt["url"]
+                acodec = fmt.get("acodec")
+                break
+    if not url:
+        raise SourceError("no playable audio stream found")
+    return ResolvedStream(url=url, acodec=acodec, resolved_at=time.monotonic())
+
+
 async def search(query: str, source: str, requested_by: str) -> list[Track]:
     """Return up to 10 metadata-only results for a search term."""
     prefix = SEARCH_PREFIXES[source]
@@ -111,19 +141,26 @@ async def search(query: str, source: str, requested_by: str) -> list[Track]:
 async def fetch_track(url: str, requested_by: str) -> Track:
     """Fully extract a direct URL into a Track (validates it up front)."""
     info = await asyncio.to_thread(_extract, url, flat=False)
-    return _track_from_entry(_first_entry(info), requested_by)
+    entry = _first_entry(info)
+    track = _track_from_entry(entry, requested_by)
+    # We already paid for a full extraction; keep the stream so playback
+    # doesn't have to extract again.
+    try:
+        track.stream = _stream_from_info(entry)
+    except SourceError:
+        pass  # playback's own resolve will surface the error
+    return track
 
 
-async def resolve_stream(track: Track) -> str:
-    """Resolve the audio stream URL right before playback (stream URLs expire)."""
+async def resolve_stream(track: Track) -> ResolvedStream:
+    """Resolve the audio stream for a track, reusing a fresh cached result.
+
+    Stream URLs expire, so cached results are only reused within
+    STREAM_TTL_SECONDS of being resolved.
+    """
+    cached = track.stream
+    if cached is not None and time.monotonic() - cached.resolved_at < STREAM_TTL_SECONDS:
+        return cached
     info = await asyncio.to_thread(_extract, track.webpage_url, flat=False)
-    info = _first_entry(info)
-    url = info.get("url")
-    if not url:
-        for fmt in reversed(info.get("formats") or []):
-            if fmt.get("url") and fmt.get("acodec") not in (None, "none"):
-                url = fmt["url"]
-                break
-    if not url:
-        raise SourceError("no playable audio stream found")
-    return url
+    track.stream = _stream_from_info(_first_entry(info))
+    return track.stream
