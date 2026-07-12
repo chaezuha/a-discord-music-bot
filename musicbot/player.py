@@ -33,6 +33,7 @@ def _before_options(resolved: ResolvedStream) -> str:
     blob = "".join(f"{k}: {v}\r\n" for k, v in resolved.http_headers.items())
     return f"{FFMPEG_BEFORE_OPTIONS} -headers {shlex.quote(blob)}"
 
+
 # A track that "finishes" implausibly fast almost certainly hit a dead stream
 # URL: ffmpeg exits on HTTP errors without reporting a playback error, so we
 # detect it by elapsed time relative to the advertised duration.

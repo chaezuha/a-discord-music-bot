@@ -205,7 +205,9 @@ def build_queue_embed(player, page: int) -> QueuePage:
     if tracks:
         total, all_known = queue_totals(tracks)
         plural = "s" if len(tracks) != 1 else ""
-        footer.append(f"{len(tracks)} track{plural} — {fmt_duration(total)}{'' if all_known else '+'} queued")
+        footer.append(
+            f"{len(tracks)} track{plural} — {fmt_duration(total)}{'' if all_known else '+'} queued"
+        )
     if player.song_looping:
         footer.append("\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} song loop on")
     if player.queue_looping:
@@ -443,7 +445,9 @@ class NowPlayingView(discord.ui.View):
     async def pause_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await self._run(interaction, self.controller.np_pause_resume(interaction, self.player, self))
+        await self._run(
+            interaction, self.controller.np_pause_resume(interaction, self.player, self)
+        )
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, row=0)
     async def skip_button(

@@ -869,9 +869,7 @@ def test_enqueue_playlist_stops_when_queue_fills(track_factory):
     assert [t.title for t in player.queue] == ["Song 0", "Song 1"]
 
 
-def test_enqueue_playlist_front_with_full_queue_keeps_first_tracks(
-    track_factory, monkeypatch
-):
+def test_enqueue_playlist_front_with_full_queue_keeps_first_tracks(track_factory, monkeypatch):
     from musicbot import music as music_module
 
     cog = make_playlist_cog()
@@ -1031,9 +1029,7 @@ def test_build_queue_embed_clamps_page_into_range(track_factory):
 
 
 def test_build_queue_embed_marks_unknown_durations_in_total(track_factory):
-    player = ViewPlayer(
-        [track_factory("A", duration=90), track_factory("Live", duration=None)]
-    )
+    player = ViewPlayer([track_factory("A", duration=90), track_factory("Live", duration=None)])
     page = ui.build_queue_embed(player, 0)
     assert "1:30+ queued" in page.embed.footer.text
 
@@ -1123,9 +1119,7 @@ async def test_queue_view_remove_matches_by_identity(track_factory):
     # index shifts, but the selection must still remove "Song 2".
     player.remove_at(0)
 
-    interaction, edits, _, followups = make_view_interaction(
-        voice_channel=player.voice.channel
-    )
+    interaction, edits, _, followups = make_view_interaction(voice_channel=player.voice.channel)
     await view._remove_row(interaction, 2)
     assert [t.title for t in player.queue] == ["Song 1", "Song 3"]
     assert target.title == "Song 2"
@@ -1135,14 +1129,14 @@ async def test_queue_view_remove_matches_by_identity(track_factory):
 
 
 async def test_queue_view_remove_vanished_track_reports_and_rerenders(track_factory):
-    player = ViewPlayer([track_factory("Song 0", duration=60), track_factory("Song 1", duration=60)])
+    player = ViewPlayer(
+        [track_factory("Song 0", duration=60), track_factory("Song 1", duration=60)]
+    )
     view = ui.QueueView(player, make_cog())
     view.refresh()
 
     player.remove_at(0)  # the pick target disappears entirely
-    interaction, edits, _, followups = make_view_interaction(
-        voice_channel=player.voice.channel
-    )
+    interaction, edits, _, followups = make_view_interaction(voice_channel=player.voice.channel)
     await view._remove_row(interaction, 0)
     assert [t.title for t in player.queue] == ["Song 1"]  # nothing else removed
     assert edits

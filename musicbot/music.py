@@ -243,8 +243,7 @@ class Music(commands.Cog):
             raise UserError(f"The queue is full (max {MAX_QUEUE_SIZE} tracks).")
         title = esc(truncate(result.playlist_title or "playlist", TITLE_DISPLAY_LIMIT))
         message = (
-            f"\N{HEAVY PLUS SIGN} Added {added} of {result.playlist_total} tracks "
-            f"from **{title}**"
+            f"\N{HEAVY PLUS SIGN} Added {added} of {result.playlist_total} tracks from **{title}**"
         )
         if added < len(result.tracks):
             return f"{message} — the queue filled up."
@@ -308,7 +307,9 @@ class Music(commands.Cog):
             )
             player = await self._ensure_player(interaction)
             if result.playlist_total is None:
-                await interaction.followup.send(self._enqueue(player, result.tracks[0], front=front))
+                await interaction.followup.send(
+                    self._enqueue(player, result.tracks[0], front=front)
+                )
             else:
                 await interaction.followup.send(self._enqueue_playlist(player, result, front=front))
             return
@@ -495,9 +496,7 @@ class Music(commands.Cog):
     async def np_queue(self, interaction: discord.Interaction, player: GuildPlayer) -> None:
         """A private queue page — only the person who clicked sees it."""
         view = QueueView(player, self)
-        await interaction.response.send_message(
-            embed=view.refresh(), view=view, ephemeral=True
-        )
+        await interaction.response.send_message(embed=view.refresh(), view=view, ephemeral=True)
         view.message = await interaction.original_response()
 
     async def np_stop(self, interaction: discord.Interaction, player: GuildPlayer) -> None:
@@ -721,7 +720,9 @@ class Music(commands.Cog):
         count = player.clear_queue()
         plural = "s" if count != 1 else ""
         suffix = " — the current track keeps playing." if player.is_active else "."
-        await interaction.response.send_message(f"\N{WASTEBASKET} Cleared {count} track{plural}{suffix}")
+        await interaction.response.send_message(
+            f"\N{WASTEBASKET} Cleared {count} track{plural}{suffix}"
+        )
 
     @app_commands.command(
         name="remove-mine", description="Remove every track you requested from the queue"

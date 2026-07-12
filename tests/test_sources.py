@@ -458,8 +458,7 @@ async def test_fetch_tracks_playlist_respects_limit(monkeypatch):
             "title": "My Mix",
             "playlist_count": 40,
             "entries": [
-                {"title": f"Song {i}", "url": f"https://youtube.com/watch?v={i}"}
-                for i in range(15)
+                {"title": f"Song {i}", "url": f"https://youtube.com/watch?v={i}"} for i in range(15)
             ],
         },
     )
@@ -514,5 +513,7 @@ async def test_fetch_tracks_empty_playlist_raises(monkeypatch):
 async def test_fetch_tracks_enforces_allowlist_before_extracting(monkeypatch):
     calls = patch_extract(monkeypatch, {"title": "x"})
     with pytest.raises(SourceError, match="allowed list"):
-        await sources.fetch_tracks("https://evil.example/list", requested_by="me", playlist_limit=10)
+        await sources.fetch_tracks(
+            "https://evil.example/list", requested_by="me", playlist_limit=10
+        )
     assert calls == []
