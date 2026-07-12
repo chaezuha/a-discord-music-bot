@@ -39,12 +39,26 @@ class FakeBot:
         return self.owner
 
 
+class FakeMessage:
+    def __init__(self, content: str | None, kwargs: dict) -> None:
+        self.content = content
+        self.kwargs = kwargs  # embed=, view=, … as passed to send()
+        self.edits: list[dict] = []
+
+    async def edit(self, **kwargs) -> None:
+        self.edits.append(kwargs)
+
+
 class FakeChannel:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.sent: list[FakeMessage] = []
 
-    async def send(self, content: str | None = None, **kwargs) -> None:
+    async def send(self, content: str | None = None, **kwargs) -> FakeMessage:
         self.messages.append(content or "")
+        message = FakeMessage(content, kwargs)
+        self.sent.append(message)
+        return message
 
 
 class FakeVoiceClient:
@@ -147,6 +161,7 @@ async def make_player(voice, channel, monkeypatch):
         resolve=None,
         on_destroy=None,
         notifier=None,
+        now_playing_factory=None,
     ) -> tuple[GuildPlayer, list]:
         async def default_resolve(track: Track) -> ResolvedStream:
             return fake_stream(track)
@@ -164,6 +179,7 @@ async def make_player(voice, channel, monkeypatch):
             idle_timeout=idle_timeout,
             on_destroy=on_destroy or (lambda: destroyed.append(True)),
             notifier=notifier,
+            now_playing_factory=now_playing_factory,
         )
         voice.player = player
         players.append(player)

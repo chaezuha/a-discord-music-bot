@@ -9,10 +9,14 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 ## Features
 
 - `/play` with direct URLs — YouTube, SoundCloud, and Bandcamp out of the box; the `ALLOWED_URL_DOMAINS` setting can open it up to [anything yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)
-- Search by name and pick from a dropdown of the top 10 matches (YouTube by default, SoundCloud via the `source` option)
-- Per-server queue with add, view, skip, jump-the-queue (`/playnext`), and fuzzy remove-by-name
+- Playlist and album URLs import their first tracks in one go (10 by default, `PLAYLIST_MAX_TRACKS` to change)
+- Search by name and pick from a private dropdown of the top 10 matches (YouTube by default, SoundCloud via the `source` option)
+- A now-playing card with thumbnail, progress bar, and Pause/Skip/Loop/Queue/Stop buttons
+- Paginated `/queue` with Prev/Next buttons, total queued time, estimated start times, and a remove-a-track menu
+- Queue management: `/move`, `/shuffle`, `/clear`, `/remove` (with live suggestions), `/remove-mine`, jump-the-queue (`/playnext`)
 - Majority-vote skipping (`/skip`) with a no-vote escape hatch (`/forceskip`)
 - `/loopsong` to repeat the current track, `/loopqueue` to cycle the whole queue
+- Failed streams retry once on a fresh URL before skipping
 - Pauses itself when everyone leaves the voice channel and resumes when someone comes back
 - Auto-disconnects after 3 minutes of inactivity or an empty channel (configurable)
 - Can DM the bot owner when repeated failures suggest yt-dlp needs an update (set `OWNER_ID`)
@@ -30,13 +34,18 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 | `/forceskip`               | Skip the current track immediately, no vote.                                                              |
 | `/loopsong`                | Repeat the current track until you run `/loopsong` again.                                                  |
 | `/loopqueue`               | Loop the whole queue — finished tracks return to the end.                                                  |
-| `/queue`                   | Show the current track (with elapsed time) and upcoming queue.                                            |
-| `/remove <number or name>` | Remove a queued track by its `/queue` number or closest-matching name.                                    |
+| `/queue`                   | Browse the queue page by page, with totals, estimated start times, and a remove-a-track menu.             |
+| `/move <track> <position>` | Move a queued track to a new position (autocompletes from the queue).                                     |
+| `/shuffle`                 | Shuffle the queue.                                                                                        |
+| `/clear`                   | Clear the queue — the current track keeps playing.                                                        |
+| `/remove <number or name>` | Remove a queued track by its `/queue` number or closest-matching name (autocompletes from the queue).     |
+| `/remove-mine`             | Remove every track you requested from the queue.                                                          |
 | `/stop`                    | Stop playback, clear the queue, and disconnect.                                                           |
 | `/help`                    | List all commands.                                                                                        |
 
 Control commands (`/pause`, `/resume`, `/skip`, `/forceskip`, `/loopsong`,
-`/loopqueue`, `/remove`, `/stop`) only work while you're in the bot's voice
+`/loopqueue`, `/move`, `/shuffle`, `/clear`, `/remove`, `/remove-mine`,
+`/stop`) and the now-playing buttons only work while you're in the bot's voice
 channel; `/queue` and `/help` are open to everyone.
 
 ## Setup
@@ -135,6 +144,7 @@ ID for instant sync while testing.
 | `DISCORD_TOKEN`        | yes      | Bot token from the Developer Portal.                         |
 | `DEV_GUILD_ID`         | no       | Server ID for instant slash-command sync during development. |
 | `IDLE_TIMEOUT_SECONDS` | no       | Seconds before auto-disconnect, for both idle playback and an empty voice channel (default `180`). |
+| `PLAYLIST_MAX_TRACKS`  | no       | How many tracks `/play` imports from a playlist or album URL (default `10`, max `500`). |
 | `OWNER_ID`             | no       | Your Discord user ID. If set, the bot DMs you when repeated failures suggest yt-dlp needs an update. |
 | `ALLOWED_URL_DOMAINS`  | no       | Which sites direct URLs may point at. Unset: YouTube, SoundCloud, and Bandcamp (subdomains included). A comma-separated domain list **replaces** those defaults. `*` disables the check and allows any yt-dlp-supported site — only do this on servers where you trust everyone, since URLs are fetched from inside your network. |
 

@@ -117,6 +117,52 @@ def test_first_entry_rejects_empty_playlists():
         _first_entry({"entries": [None]})
 
 
+# -- track thumbnails -------------------------------------------------------
+
+
+def test_track_thumbnail_prefers_direct_key():
+    entry = {"title": "T", "thumbnail": "https://thumb", "thumbnails": [{"url": "https://other"}]}
+    assert sources._track_from_entry(entry, "me").thumbnail == "https://thumb"
+
+
+def test_track_thumbnail_falls_back_to_largest_in_list():
+    entry = {
+        "title": "T",
+        "thumbnails": [{"url": "https://small"}, {"url": "https://large"}],
+    }
+    assert sources._track_from_entry(entry, "me").thumbnail == "https://large"
+
+
+def test_track_thumbnail_skips_entries_without_url():
+    entry = {"title": "T", "thumbnails": [{"url": "https://small"}, {"id": "no-url"}]}
+    assert sources._track_from_entry(entry, "me").thumbnail == "https://small"
+
+
+def test_track_thumbnail_missing_is_none():
+    assert sources._track_from_entry({"title": "T"}, "me").thumbnail is None
+
+
+# -- progress bar -----------------------------------------------------------
+
+
+def test_progress_bar_positions():
+    bar = sources.progress_bar(0, 100)
+    assert bar.startswith("\N{RADIO BUTTON}") and len(bar) == 12
+
+    bar = sources.progress_bar(50, 100)
+    assert bar[6] == "\N{RADIO BUTTON}"
+
+    # At (or past) the end the knob pins to the last slot.
+    assert sources.progress_bar(100, 100)[-1] == "\N{RADIO BUTTON}"
+    assert sources.progress_bar(250, 100)[-1] == "\N{RADIO BUTTON}"
+
+
+def test_progress_bar_unknown_halves_are_empty():
+    assert sources.progress_bar(None, 100) == ""
+    assert sources.progress_bar(30, None) == ""
+    assert sources.progress_bar(30, 0) == ""
+
+
 # -- URL allowlist ----------------------------------------------------------
 
 
@@ -378,3 +424,95 @@ async def test_fetch_track_prepopulates_stream_cache(monkeypatch):
     resolved = await sources.resolve_stream(track)
     assert resolved is track.stream
     assert len(calls) == 1
+
+
+# -- fetch_tracks (playlist import) ----------------------------------------
+
+
+async def test_fetch_tracks_single_video_keeps_full_extraction(monkeypatch):
+    calls = patch_extract(
+        monkeypatch,
+        {
+            "title": "Song",
+            "webpage_url": "https://w",
+            "duration": 42,
+            "uploader": "U",
+            "url": "https://stream",
+            "acodec": "opus",
+        },
+    )
+    result = await sources.fetch_tracks(VIDEO_URL, requested_by="me", playlist_limit=10)
+    assert calls == [(VIDEO_URL, "in_playlist")]
+    assert result.playlist_total is None
+    assert result.playlist_title is None
+    (track,) = result.tracks
+    assert (track.title, track.webpage_url) == ("Song", "https://w")
+    # The single full extraction pre-populates the stream cache.
+    assert track.stream is not None and track.stream.url == "https://stream"
+
+
+async def test_fetch_tracks_playlist_respects_limit(monkeypatch):
+    patch_extract(
+        monkeypatch,
+        {
+            "title": "My Mix",
+            "playlist_count": 40,
+            "entries": [
+                {"title": f"Song {i}", "url": f"https://youtube.com/watch?v={i}"}
+                for i in range(15)
+            ],
+        },
+    )
+    result = await sources.fetch_tracks(PLAYLIST_URL, requested_by="me", playlist_limit=10)
+    assert len(result.tracks) == 10
+    assert result.playlist_title == "My Mix"
+    assert result.playlist_total == 40
+    # Flat entries use their page URL as the display link.
+    assert result.tracks[0].webpage_url == "https://youtube.com/watch?v=0"
+    assert all(t.requested_by == "me" for t in result.tracks)
+
+
+async def test_fetch_tracks_total_falls_back_to_entry_count(monkeypatch):
+    patch_extract(
+        monkeypatch,
+        {
+            "title": "Mix",
+            "entries": [
+                {"title": "A", "url": "https://youtube.com/watch?v=a"},
+                {"title": "B", "url": "https://youtube.com/watch?v=b"},
+            ],
+        },
+    )
+    result = await sources.fetch_tracks(PLAYLIST_URL, requested_by="me", playlist_limit=10)
+    assert result.playlist_total == 2
+
+
+async def test_fetch_tracks_skips_entries_without_url_or_off_allowlist(monkeypatch):
+    patch_extract(
+        monkeypatch,
+        {
+            "title": "Mix",
+            "entries": [
+                {"title": "No URL"},
+                {"title": "Evil", "url": "https://evil.example/x"},
+                {"title": "Good", "url": "https://youtube.com/watch?v=ok"},
+                None,
+            ],
+        },
+    )
+    result = await sources.fetch_tracks(PLAYLIST_URL, requested_by="me", playlist_limit=10)
+    assert [t.title for t in result.tracks] == ["Good"]
+    assert result.playlist_total == 3  # skipped entries still count toward the total
+
+
+async def test_fetch_tracks_empty_playlist_raises(monkeypatch):
+    patch_extract(monkeypatch, {"title": "Mix", "entries": [None]})
+    with pytest.raises(SourceError):
+        await sources.fetch_tracks(PLAYLIST_URL, requested_by="me", playlist_limit=10)
+
+
+async def test_fetch_tracks_enforces_allowlist_before_extracting(monkeypatch):
+    calls = patch_extract(monkeypatch, {"title": "x"})
+    with pytest.raises(SourceError, match="allowed list"):
+        await sources.fetch_tracks("https://evil.example/list", requested_by="me", playlist_limit=10)
+    assert calls == []

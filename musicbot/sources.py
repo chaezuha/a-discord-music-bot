@@ -92,6 +92,7 @@ class Track:
     duration: int | None
     uploader: str
     requested_by: str
+    thumbnail: str | None = None
     stream: ResolvedStream | None = field(default=None, compare=False)
 
 
@@ -149,6 +150,16 @@ def fmt_duration(seconds: float | None) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+def progress_bar(position: float | None, duration: float | None, width: int = 12) -> str:
+    """A textual playback bar (`▬▬🔘▬▬…`); empty when either half is unknown."""
+    if position is None or not duration:
+        return ""
+    filled = int(width * min(position, duration) / duration)
+    filled = min(filled, width - 1)
+    segment = "\N{BLACK RECTANGLE}"
+    return segment * filled + "\N{RADIO BUTTON}" + segment * (width - 1 - filled)
+
+
 def fmt_title(track: Track) -> str:
     """Bold title, hyperlinked to the track's page when we have one.
 
@@ -168,10 +179,12 @@ def _clean_error(exc: Exception) -> str:
     return truncate(message, ERROR_DISPLAY_LIMIT) or "unknown extraction error"
 
 
-def _extract(url_or_query: str, *, flat: bool) -> dict:
+def _extract(url_or_query: str, *, flat: bool | str) -> dict:
+    """Run yt-dlp. `flat` may be True, False, or "in_playlist" (playlist entries
+    stay flat while a bare video URL still gets a full extraction)."""
     opts = dict(_BASE_OPTS)
     if flat:
-        opts["extract_flat"] = True
+        opts["extract_flat"] = flat
     try:
         with _extract_gate, yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url_or_query, download=False)
@@ -192,6 +205,16 @@ def _first_entry(info: dict) -> dict:
     return info
 
 
+def _thumbnail_from_entry(entry: dict) -> str | None:
+    if entry.get("thumbnail"):
+        return entry["thumbnail"]
+    # yt-dlp orders thumbnails smallest to largest.
+    for thumb in reversed(entry.get("thumbnails") or []):
+        if isinstance(thumb, dict) and thumb.get("url"):
+            return thumb["url"]
+    return None
+
+
 def _track_from_entry(entry: dict, requested_by: str, *, flat: bool = False) -> Track:
     # In a flat search entry "url" is the track's page; in a full extraction
     # it can be a signed media URL, which must never become the display link.
@@ -204,6 +227,7 @@ def _track_from_entry(entry: dict, requested_by: str, *, flat: bool = False) -> 
         duration=entry.get("duration"),
         uploader=entry.get("uploader") or entry.get("channel") or "",
         requested_by=requested_by,
+        thumbnail=_thumbnail_from_entry(entry),
     )
 
 
@@ -250,6 +274,60 @@ async def fetch_track(url: str, requested_by: str) -> Track:
     except SourceError:
         pass  # playback's own resolve will surface the error
     return track
+
+
+@dataclass
+class FetchResult:
+    """What a direct URL turned out to be: one track, or part of a playlist."""
+
+    tracks: list[Track]
+    playlist_title: str | None = None
+    playlist_total: int | None = None  # None -> the URL was a single track
+
+
+async def fetch_tracks(url: str, requested_by: str, playlist_limit: int) -> FetchResult:
+    """Extract a direct URL into one track or a capped list of playlist tracks.
+
+    Playlist entries come back flat — one extraction covers the whole list,
+    like search does — while a bare video URL still gets a full extraction
+    with its stream cached (noplaylist keeps mixed watch?v=…&list=… URLs on
+    the single video).
+    """
+    check_url_allowed(url)
+    info = await asyncio.to_thread(_extract, url, flat="in_playlist")
+
+    if "entries" not in info:
+        track = _track_from_entry(info, requested_by)
+        # We already paid for a full extraction; keep the stream so playback
+        # doesn't have to extract again.
+        try:
+            track.stream = _stream_from_info(info)
+        except SourceError:
+            pass  # playback's own resolve will surface the error
+        return FetchResult(tracks=[track])
+
+    entries = [e for e in (info.get("entries") or []) if e]
+    tracks: list[Track] = []
+    for entry in entries:
+        if len(tracks) >= playlist_limit:
+            break
+        track = _track_from_entry(entry, requested_by, flat=True)
+        if not track.webpage_url:
+            continue
+        try:
+            # Defense in depth: every entry a playlist hands us must itself
+            # pass the domain allowlist before we ever extract it.
+            check_url_allowed(track.webpage_url)
+        except SourceError:
+            continue
+        tracks.append(track)
+    if not tracks:
+        raise SourceError("no playable entries found at that URL")
+    return FetchResult(
+        tracks=tracks,
+        playlist_title=info.get("title"),
+        playlist_total=info.get("playlist_count") or len(entries),
+    )
 
 
 async def resolve_stream(track: Track) -> ResolvedStream:

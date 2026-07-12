@@ -7,14 +7,24 @@ import difflib
 import logging
 import math
 import os
+import re
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from . import sources
+from .errors import UserError
 from .notifier import BreakageNotifier
-from .player import MAX_QUEUE_SIZE, GuildPlayer, QueueFullError
+from .player import (
+    MAX_QUEUE_SIZE,
+    GuildPlayer,
+    QueueFullError,
+    tally_skip_vote,
+)
+from .player import (
+    votes_needed as votes_needed,  # re-exported; tests and /skip docs import it from here
+)
 from .sources import (
     TITLE_DISPLAY_LIMIT,
     SourceError,
@@ -24,14 +34,31 @@ from .sources import (
     is_url,
     truncate,
 )
-from .ui import SearchPicker
+from .ui import (
+    EMBED_DESCRIPTION_LIMIT as EMBED_DESCRIPTION_LIMIT,  # re-exported for backwards compat
+)
+from .ui import (
+    QUEUE_PAGE_SIZE as QUEUE_PAGE_SIZE,
+)
+from .ui import (
+    NowPlayingView,
+    QueueView,
+    SearchPicker,
+    build_now_playing_embed,
+    clamp_description,
+    fmt_progress,
+)
 
 log = logging.getLogger(__name__)
 
-QUEUE_PAGE_SIZE = 15
 MAX_QUERY_LENGTH = 500
-EMBED_DESCRIPTION_LIMIT = 4096
 DESTROY_WAIT_SECONDS = 10
+
+# Discord caps autocomplete at 25 choices and choice names/values at 100 chars.
+AUTOCOMPLETE_MAX_CHOICES = 25
+AUTOCOMPLETE_TITLE_PREFIX = 90
+# How deep into a huge queue autocomplete searches before giving up.
+AUTOCOMPLETE_SCAN_LIMIT = 200
 
 esc = discord.utils.escape_markdown
 
@@ -39,15 +66,6 @@ SOURCE_CHOICES = [
     app_commands.Choice(name="YouTube", value="youtube"),
     app_commands.Choice(name="SoundCloud", value="soundcloud"),
 ]
-
-
-class UserError(Exception):
-    """A problem the user can fix; shown as-is in chat."""
-
-
-def votes_needed(listener_count: int) -> int:
-    """Votes required to pass a skip: half the listeners, rounded up (minimum 1)."""
-    return max(1, (listener_count + 1) // 2)
 
 
 def env_id(name: str) -> int | None:
@@ -59,6 +77,22 @@ def env_id(name: str) -> int | None:
         return int(raw)
     except ValueError:
         raise ValueError(f"{name} must be a numeric Discord ID, got {raw!r}.") from None
+
+
+def env_playlist_max(default: int = 10) -> int:
+    """Parse PLAYLIST_MAX_TRACKS: how many tracks /play imports from a playlist."""
+    raw = (os.getenv("PLAYLIST_MAX_TRACKS") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"PLAYLIST_MAX_TRACKS must be a whole number, got {raw!r}.") from None
+    if not 1 <= value <= MAX_QUEUE_SIZE:
+        raise ValueError(
+            f"PLAYLIST_MAX_TRACKS must be between 1 and {MAX_QUEUE_SIZE}, got {raw!r}."
+        )
+    return value
 
 
 def env_idle_timeout(default: float = 180.0) -> float:
@@ -85,6 +119,7 @@ class Music(commands.Cog):
         self.players: dict[int, GuildPlayer] = {}
         self._player_locks: dict[int, asyncio.Lock] = {}
         self.idle_timeout = env_idle_timeout()
+        self.playlist_max = env_playlist_max()
         self.notifier = BreakageNotifier(env_id("OWNER_ID"))
 
     async def cog_unload(self) -> None:
@@ -141,6 +176,10 @@ class Music(commands.Cog):
                 idle_timeout=self.idle_timeout,
                 on_destroy=lambda: self._remove_player(guild_id, player),
                 notifier=self.notifier,
+                now_playing_factory=lambda p: (
+                    build_now_playing_embed(p),
+                    NowPlayingView(p, self),
+                ),
             )
             self.players[guild_id] = player
             return player
@@ -181,6 +220,38 @@ class Music(commands.Cog):
             )
         return f"\N{BLACK RIGHT-POINTING TRIANGLE} Queued {fmt_title(track)} ({fmt_duration(track.duration)}) — starting now"
 
+    def _enqueue_playlist(
+        self, player: GuildPlayer, result: sources.FetchResult, front: bool = False
+    ) -> str:
+        """Enqueue an imported playlist, reporting how much of it made it in."""
+        added = 0
+        tracks = result.tracks
+        if front:
+            # Enqueueing at the front reverses order; feed tracks backwards so
+            # the playlist comes out in its own order — but cap to the queue's
+            # remaining capacity first, or a full queue would drop the
+            # playlist's *first* tracks instead of its last.
+            capacity = max(0, MAX_QUEUE_SIZE - len(player.queue))
+            tracks = list(reversed(tracks[:capacity]))
+        for track in tracks:
+            try:
+                player.enqueue(track, front=front)
+            except QueueFullError:
+                break
+            added += 1
+        if added == 0:
+            raise UserError(f"The queue is full (max {MAX_QUEUE_SIZE} tracks).")
+        title = esc(truncate(result.playlist_title or "playlist", TITLE_DISPLAY_LIMIT))
+        message = (
+            f"\N{HEAVY PLUS SIGN} Added {added} of {result.playlist_total} tracks "
+            f"from **{title}**"
+        )
+        if added < len(result.tracks):
+            return f"{message} — the queue filled up."
+        if result.playlist_total and result.playlist_total > added:
+            return f"{message} (playlist import is capped at {self.playlist_max})."
+        return f"{message}."
+
     async def _on_pick(
         self, interaction: discord.Interaction, track: Track, front: bool = False
     ) -> None:
@@ -191,13 +262,23 @@ class Music(commands.Cog):
             player = await self._ensure_player(interaction)
             message = self._enqueue(player, track, front=front)
         except UserError as exc:
-            message = str(exc)
+            # Errors stay on the (ephemeral) picker: only the requester's problem.
+            await interaction.edit_original_response(content=str(exc), view=None)
+            return
         except Exception:
             # View callbacks don't reach cog_app_command_error; without this
             # the deferred response would spin forever.
             log.exception("Failed to queue picked track")
-            message = "Something went wrong queueing that track."
-        await interaction.edit_original_response(content=message, view=None)
+            await interaction.edit_original_response(
+                content="Something went wrong queueing that track.", view=None
+            )
+            return
+        # The picker is ephemeral, so the enqueue confirmation goes out as a
+        # regular message the whole channel can see.
+        await interaction.edit_original_response(
+            content="\N{WHITE HEAVY CHECK MARK} Queued.", view=None
+        )
+        await interaction.followup.send(message)
 
     async def _play_impl(
         self,
@@ -222,9 +303,14 @@ class Music(commands.Cog):
         if is_url(query):
             # Failures here don't feed the breakage notifier: user-typed URLs
             # are typo-prone and deliberately triggerable.
-            track = await sources.fetch_track(query, requested_by=requested_by)
+            result = await sources.fetch_tracks(
+                query, requested_by=requested_by, playlist_limit=self.playlist_max
+            )
             player = await self._ensure_player(interaction)
-            await interaction.followup.send(self._enqueue(player, track, front=front))
+            if result.playlist_total is None:
+                await interaction.followup.send(self._enqueue(player, result.tracks[0], front=front))
+            else:
+                await interaction.followup.send(self._enqueue_playlist(player, result, front=front))
             return
 
         source_key = source.value if source else "youtube"
@@ -244,9 +330,13 @@ class Music(commands.Cog):
             await self._on_pick(pick_interaction, track, front=front)
 
         view = SearchPicker(tracks, interaction.user, on_pick)
+        # Ephemeral: only the requester sees the picker. The returned
+        # WebhookMessage edits through the interaction token (valid 15 min),
+        # so the view's 60s-timeout cleanup still works on it.
         view.message = await interaction.followup.send(
             f"\N{LEFT-POINTING MAGNIFYING GLASS} Top results for **{esc(query)}** — pick one:",
             view=view,
+            ephemeral=True,
         )
 
     # -- commands ----------------------------------------------------------
@@ -353,9 +443,18 @@ class Music(commands.Cog):
             or user.voice.channel != channel
         ):
             raise UserError("Join my voice channel to vote to skip.")
+        await self._handle_skip_vote(interaction, player)
 
+    async def _handle_skip_vote(
+        self, interaction: discord.Interaction, player: GuildPlayer
+    ) -> None:
+        """Count the caller's vote and skip when it carries (shared with the
+        now-playing Skip button; the caller has verified voice membership)."""
+        channel = player.voice.channel
         listener_ids = {m.id for m in channel.members if not m.bot}
-        passed, already_voted, needed = self._tally_skip_vote(player, user.id, listener_ids)
+        passed, already_voted, needed = self._tally_skip_vote(
+            player, interaction.user.id, listener_ids
+        )
         if passed:
             verb = "Vote passed — skipped" if needed > 1 else "Skipped"
             await interaction.response.send_message(self._do_skip(player, verb))
@@ -366,21 +465,48 @@ class Music(commands.Cog):
                 f"Vote to skip: **{len(player.skip_votes)}/{needed}** — `/skip` to add your vote."
             )
 
-    @staticmethod
-    def _tally_skip_vote(
-        player: GuildPlayer, voter_id: int, listener_ids: set[int]
-    ) -> tuple[bool, bool, int]:
-        """Prune departed voters and register this vote.
+    _tally_skip_vote = staticmethod(tally_skip_vote)
 
-        Returns (passed, already_voted, needed). The threshold is evaluated
-        even for a repeat vote: listeners leaving can turn the existing votes
-        into a majority.
-        """
-        needed = votes_needed(len(listener_ids))
-        player.skip_votes &= listener_ids
-        already_voted = voter_id in player.skip_votes
-        player.skip_votes.add(voter_id)
-        return len(player.skip_votes) >= needed, already_voted, needed
+    # -- now-playing button controllers (called by ui.NowPlayingView; the view
+    # has already checked staleness and voice-channel membership) -----------
+
+    async def np_pause_resume(
+        self, interaction: discord.Interaction, player: GuildPlayer, view: NowPlayingView
+    ) -> None:
+        if player.voice.is_paused():
+            player.resume()
+        elif player.voice.is_playing():
+            player.pause()
+        else:
+            raise UserError("Nothing is playing right now.")
+        await view.refresh(interaction)
+
+    async def np_skip(self, interaction: discord.Interaction, player: GuildPlayer) -> None:
+        await self._handle_skip_vote(interaction, player)
+
+    async def np_loop(
+        self, interaction: discord.Interaction, player: GuildPlayer, view: NowPlayingView
+    ) -> None:
+        player.song_looping = not player.song_looping
+        if player.song_looping:
+            player.queue_looping = False
+        await view.refresh(interaction)
+
+    async def np_queue(self, interaction: discord.Interaction, player: GuildPlayer) -> None:
+        """A private queue page — only the person who clicked sees it."""
+        view = QueueView(player, self)
+        await interaction.response.send_message(
+            embed=view.refresh(), view=view, ephemeral=True
+        )
+        view.message = await interaction.original_response()
+
+    async def np_stop(self, interaction: discord.Interaction, player: GuildPlayer) -> None:
+        # Respond before destroy(): teardown strips this very view's message,
+        # and the click must not be left unacknowledged.
+        await interaction.response.send_message(
+            "\N{BLACK SQUARE FOR STOP} Stopped playback and cleared the queue. Bye!"
+        )
+        await player.destroy()
 
     @app_commands.command(description="Skip the current track immediately, no vote")
     @app_commands.guild_only()
@@ -410,66 +536,13 @@ class Music(commands.Cog):
         player = self.players.get(interaction.guild_id)
         if player is None or (player.now_playing is None and not player.queue):
             raise UserError("The queue is empty and nothing is playing.")
+        view = QueueView(player, self)
+        await interaction.response.send_message(embed=view.refresh(), view=view)
+        view.message = await interaction.original_response()
 
-        lines = []
-        if player.now_playing is not None:
-            track = player.now_playing
-            marker = (
-                " \N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} (looping)"
-                if player.song_looping
-                else ""
-            )
-            if player.voice.is_paused():
-                marker += " \N{DOUBLE VERTICAL BAR} (paused)"
-            lines.append(
-                f"**Now playing:** {fmt_title(track)} ({self._fmt_progress(player, track)})"
-                f"{marker} — requested by {track.requested_by}\n"
-            )
-        queue_lines = [
-            f"`{i}.` {fmt_title(track)} ({fmt_duration(track.duration)}) — {track.requested_by}"
-            for i, track in enumerate(list(player.queue)[:QUEUE_PAGE_SIZE], start=1)
-        ]
-
-        embed = discord.Embed(
-            title="\N{MULTIPLE MUSICAL NOTES} Queue",
-            description=self._queue_description(lines, queue_lines, len(player.queue)),
-            color=discord.Color.blurple(),
-        )
-        if player.queue_looping:
-            embed.set_footer(
-                text="\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} "
-                "Queue loop is on — finished tracks return to the end."
-            )
-        await interaction.response.send_message(embed=embed)
-
-    @staticmethod
-    def _queue_description(head_lines: list[str], queue_lines: list[str], queue_size: int) -> str:
-        """Assemble the queue embed body, dropping whole lines to fit the limit."""
-        hidden = queue_size - len(queue_lines)
-
-        def build() -> str:
-            parts = head_lines + queue_lines
-            if hidden > 0:
-                parts.append(f"…and {hidden} more")
-            return "\n".join(parts)
-
-        description = build()
-        while queue_lines and len(description) > EMBED_DESCRIPTION_LIMIT:
-            queue_lines.pop()
-            hidden += 1
-            description = build()
-        return truncate(description, EMBED_DESCRIPTION_LIMIT)
-
-    @staticmethod
-    def _fmt_progress(player: GuildPlayer, track: Track) -> str:
-        """`elapsed / total`, degrading to whichever half is known."""
-        position = player.position
-        if position is None:
-            return fmt_duration(track.duration)
-        elapsed = fmt_duration(position)
-        if track.duration:
-            return f"{elapsed} / {fmt_duration(track.duration)}"
-        return elapsed
+    # Kept as delegating names: the logic lives in ui.py next to the views.
+    _queue_description = staticmethod(clamp_description)
+    _fmt_progress = staticmethod(fmt_progress)
 
     @app_commands.command(description="Toggle looping the current track (repeats until turned off)")
     @app_commands.guild_only()
@@ -562,6 +635,21 @@ class Music(commands.Cog):
     def _find_queue_index(player: GuildPlayer, target: str) -> int | None:
         if not target:
             return None  # an empty needle would match every title
+        match = re.fullmatch(r"(\d+):(.*)", target, re.DOTALL)
+        if match is not None:
+            # An autocomplete value: "position:title-prefix". The index is only
+            # trusted while the title at that position still matches — the queue
+            # may have shifted since the suggestion was shown. On a mismatch the
+            # prefix becomes an ordinary title search instead of removing the
+            # wrong track.
+            position, prefix = int(match.group(1)), match.group(2)
+            if 1 <= position <= len(player.queue) and player.queue[position - 1].title.startswith(
+                prefix
+            ):
+                return position - 1
+            target = prefix.strip()
+            if not target:
+                return None
         if target.isdigit():
             position = int(target)
             if 1 <= position <= len(player.queue):
@@ -576,6 +664,109 @@ class Music(commands.Cog):
         if close:
             return titles.index(close[0])
         return None
+
+    @app_commands.command(name="move", description="Move a queued track to a new position")
+    @app_commands.describe(
+        track="Queue number (from /queue) or part of the track's name",
+        position="New position in the queue (1 = next up)",
+    )
+    @app_commands.guild_only()
+    async def move(
+        self,
+        interaction: discord.Interaction,
+        track: str,
+        position: app_commands.Range[int, 1, MAX_QUEUE_SIZE],
+    ) -> None:
+        player = self.players.get(interaction.guild_id)
+        if player is None or not player.queue:
+            raise UserError("The queue is empty — nothing to move.")
+        self._require_same_channel(interaction, player)
+
+        track = track.strip()
+        if not track:
+            raise UserError("Tell me which track to move — a queue number or part of its name.")
+        index = self._find_queue_index(player, track)
+        if index is None:
+            raise UserError(
+                f"Couldn't find anything in the queue matching "
+                f"**{esc(truncate(track, TITLE_DISPLAY_LIMIT))}**."
+            )
+        to_index = min(position, len(player.queue)) - 1
+        moved = player.move(index, to_index)
+        await interaction.response.send_message(
+            f"\N{UP DOWN ARROW}\N{VARIATION SELECTOR-16} Moved "
+            f"**{esc(truncate(moved.title, TITLE_DISPLAY_LIMIT))}** "
+            f"from #{index + 1} to #{to_index + 1}."
+        )
+
+    @app_commands.command(description="Shuffle the queue")
+    @app_commands.guild_only()
+    async def shuffle(self, interaction: discord.Interaction) -> None:
+        player = self._player_or_error(interaction)
+        self._require_same_channel(interaction, player)
+        if len(player.queue) < 2:
+            raise UserError("The queue needs at least two tracks to shuffle.")
+        player.shuffle()
+        await interaction.response.send_message(
+            f"\N{TWISTED RIGHTWARDS ARROWS} Shuffled {len(player.queue)} tracks."
+        )
+
+    @app_commands.command(description="Clear the queue (the current track keeps playing)")
+    @app_commands.guild_only()
+    async def clear(self, interaction: discord.Interaction) -> None:
+        player = self._player_or_error(interaction)
+        self._require_same_channel(interaction, player)
+        if not player.queue:
+            raise UserError("The queue is already empty.")
+        count = player.clear_queue()
+        plural = "s" if count != 1 else ""
+        suffix = " — the current track keeps playing." if player.is_active else "."
+        await interaction.response.send_message(f"\N{WASTEBASKET} Cleared {count} track{plural}{suffix}")
+
+    @app_commands.command(
+        name="remove-mine", description="Remove every track you requested from the queue"
+    )
+    @app_commands.guild_only()
+    async def remove_mine(self, interaction: discord.Interaction) -> None:
+        player = self.players.get(interaction.guild_id)
+        if player is None or not player.queue:
+            raise UserError("The queue is empty — nothing to remove.")
+        self._require_same_channel(interaction, player)
+        # Tracks store the requester as an escaped display name (see _play_impl),
+        # so the comparison key must be escaped the same way.
+        requester = esc(interaction.user.display_name)
+        removed = player.remove_where(lambda t: t.requested_by == requester)
+        if not removed:
+            raise UserError("You have no tracks in the queue.")
+        plural = "s" if len(removed) != 1 else ""
+        await interaction.response.send_message(
+            f"\N{WASTEBASKET} Removed your {len(removed)} track{plural} from the queue."
+        )
+
+    @remove.autocomplete("target")
+    @move.autocomplete("track")
+    async def _queue_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Suggest live queue entries; values embed position + title prefix so a
+        stale suggestion degrades to a title search (see _find_queue_index)."""
+        player = self.players.get(interaction.guild_id)
+        if player is None:
+            return []  # never raise here: autocomplete errors vanish silently
+        needle = current.strip().lower()
+        choices: list[app_commands.Choice[str]] = []
+        for i, track in enumerate(list(player.queue)[:AUTOCOMPLETE_SCAN_LIMIT], start=1):
+            if needle and needle not in track.title.lower() and needle != str(i):
+                continue
+            choices.append(
+                app_commands.Choice(
+                    name=truncate(f"{i}. {track.title}", 100),
+                    value=f"{i}:{track.title[:AUTOCOMPLETE_TITLE_PREFIX]}",
+                )
+            )
+            if len(choices) == AUTOCOMPLETE_MAX_CHOICES:
+                break
+        return choices
 
     # -- events ------------------------------------------------------------
 

@@ -839,3 +839,263 @@ async def test_channel_emptying_during_resolve_pauses_playback(
     player.channel_became_occupied()
     assert not voice.paused
     assert not player.auto_paused
+
+
+# -- queue management: move / shuffle / clear / remove_where --------------------
+
+
+async def test_move_reorders_queue(make_player, voice, track_factory, wait_until):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    for title in ("Song B", "Song C", "Song D"):
+        player.enqueue(track_factory(title))
+
+    moved = player.move(2, 0)
+    assert moved.title == "Song D"
+    assert [t.title for t in player.queue] == ["Song D", "Song B", "Song C"]
+
+
+async def test_move_to_head_retargets_prefetch(make_player, voice, track_factory, wait_until):
+    calls = []
+
+    async def resolve(track):
+        calls.append(track.title)
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    player.enqueue(track_factory("Song C"))
+    await wait_until(lambda: "Song B" in calls)
+
+    player.move(1, 0)
+    await wait_until(lambda: "Song C" in calls)
+    assert player._prefetch_track.title == "Song C"
+
+    voice.finish_track()
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert voice.played_sources[1] == "stream://Song C"
+
+
+async def test_move_clamps_past_the_end(make_player, voice, track_factory, wait_until):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    player.enqueue(track_factory("Song C"))
+
+    player.move(0, 99)  # deque.insert clamps to the end
+    assert [t.title for t in player.queue] == ["Song C", "Song B"]
+
+
+async def test_shuffle_preserves_tracks_and_retargets_prefetch(
+    make_player, voice, track_factory, wait_until, monkeypatch
+):
+    calls = []
+
+    async def resolve(track):
+        calls.append(track.title)
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    for title in ("Song B", "Song C", "Song D"):
+        player.enqueue(track_factory(title))
+    await wait_until(lambda: "Song B" in calls)
+
+    def reverse_shuffle(seq):
+        seq.reverse()
+
+    monkeypatch.setattr(player_module.random, "shuffle", reverse_shuffle)
+    player.shuffle()
+    assert [t.title for t in player.queue] == ["Song D", "Song C", "Song B"]
+    await wait_until(lambda: "Song D" in calls)
+    assert player._prefetch_track.title == "Song D"
+
+    voice.finish_track()
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert voice.played_sources[1] == "stream://Song D"
+
+
+async def test_shuffle_keeping_head_skips_reprefetch(
+    make_player, voice, track_factory, wait_until, monkeypatch
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    await wait_until(lambda: player._prefetch_track is not None)
+    prefetch_task = player._prefetch_task
+
+    monkeypatch.setattr(player_module.random, "shuffle", lambda seq: None)
+    player.shuffle()
+    assert player._prefetch_task is prefetch_task  # untouched: head didn't change
+
+
+async def test_clear_queue_keeps_current_track_playing(
+    make_player, voice, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    player.enqueue(track_factory("Song C"))
+
+    assert player.clear_queue() == 2
+    assert not player.queue
+    assert player.now_playing is not None
+    assert voice.connected
+    # The old head's prefetch was cancelled along with the queue.
+    assert player._prefetch_track is None
+
+
+async def test_remove_where_removes_matching_and_retargets_prefetch(
+    make_player, voice, track_factory, wait_until
+):
+    calls = []
+
+    async def resolve(track):
+        calls.append(track.title)
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B", requested_by="alice"))
+    player.enqueue(track_factory("Song C", requested_by="bob"))
+    player.enqueue(track_factory("Song D", requested_by="alice"))
+    await wait_until(lambda: "Song B" in calls)
+
+    removed = player.remove_where(lambda t: t.requested_by == "alice")
+    assert [t.title for t in removed] == ["Song B", "Song D"]
+    assert [t.title for t in player.queue] == ["Song C"]
+    await wait_until(lambda: "Song C" in calls)
+    assert player._prefetch_track.title == "Song C"
+
+
+async def test_remove_where_no_match_leaves_queue_alone(
+    make_player, voice, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    await wait_until(lambda: player._prefetch_task is not None)
+    prefetch_task = player._prefetch_task
+
+    assert player.remove_where(lambda t: t.requested_by == "nobody") == []
+    assert [t.title for t in player.queue] == ["Song B"]
+    assert player._prefetch_task is prefetch_task
+
+
+# -- now-playing message lifecycle ---------------------------------------------
+
+
+class StubNowView:
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+def np_factory(record):
+    """A now_playing_factory that records the views it hands out."""
+
+    def factory(player):
+        view = StubNowView()
+        record.append(view)
+        return {"card": player.now_playing.title}, view
+
+    return factory
+
+
+async def test_now_playing_factory_sends_embed_with_view(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(now_playing_factory=np_factory(views))
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+
+    message = channel.sent[0]
+    assert message.kwargs["embed"] == {"card": "Song A"}
+    assert message.kwargs["view"] is views[0]
+    assert player._now_message is message
+
+
+async def test_track_change_strips_previous_controls(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(now_playing_factory=np_factory(views))
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+
+    voice.finish_track()
+    await wait_until(lambda: len(channel.sent) == 2)
+    first = channel.sent[0]
+    await wait_until(lambda: first.edits)
+    assert first.edits == [{"view": None}]
+    assert views[0].stopped
+    assert not views[1].stopped
+
+
+async def test_queue_drained_strips_controls(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(now_playing_factory=np_factory(views))
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track()
+    await wait_until(lambda: channel.sent[0].edits)
+    assert channel.sent[0].edits == [{"view": None}]
+    assert views[0].stopped
+    assert player._now_message is None
+
+
+async def test_destroy_strips_controls(make_player, voice, channel, track_factory, wait_until):
+    views = []
+    player, _ = make_player(now_playing_factory=np_factory(views))
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+
+    await player.destroy()
+    assert channel.sent[0].edits == [{"view": None}]
+    assert views[0].stopped
+
+
+async def test_song_loop_replay_does_not_resend_card(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(now_playing_factory=np_factory(views))
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.song_looping = True
+
+    voice.finish_track()
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert len(channel.sent) == 1  # same card keeps serving the replay
+    assert not channel.sent[0].edits
+    assert not views[0].stopped
+
+
+async def test_retry_after_failure_does_not_resend_card(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(now_playing_factory=np_factory(views))
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track(error=RuntimeError("403"))
+    await wait_until(lambda: len(voice.played_sources) == 2)  # the silent retry
+    assert len(channel.sent) == 1
+    assert not views[0].stopped

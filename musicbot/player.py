@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import shlex
 import time
 from collections import deque
@@ -45,6 +46,27 @@ class QueueFullError(Exception):
     """The guild's queue is at MAX_QUEUE_SIZE."""
 
 
+def votes_needed(listener_count: int) -> int:
+    """Votes required to pass a skip: half the listeners, rounded up (minimum 1)."""
+    return max(1, (listener_count + 1) // 2)
+
+
+def tally_skip_vote(
+    player: GuildPlayer, voter_id: int, listener_ids: set[int]
+) -> tuple[bool, bool, int]:
+    """Prune departed voters and register this vote.
+
+    Returns (passed, already_voted, needed). The threshold is evaluated
+    even for a repeat vote: listeners leaving can turn the existing votes
+    into a majority.
+    """
+    needed = votes_needed(len(listener_ids))
+    player.skip_votes &= listener_ids
+    already_voted = voter_id in player.skip_votes
+    player.skip_votes.add(voter_id)
+    return len(player.skip_votes) >= needed, already_voted, needed
+
+
 class GuildPlayer:
     """Owns the queue, voice client, and playback loop for one guild."""
 
@@ -56,6 +78,8 @@ class GuildPlayer:
         idle_timeout: float,
         on_destroy: Callable[[], None],
         notifier: BreakageNotifier | None = None,
+        now_playing_factory: Callable[["GuildPlayer"], tuple[discord.Embed, discord.ui.View]]
+        | None = None,
     ):
         self.bot = bot
         self.voice = voice
@@ -69,6 +93,9 @@ class GuildPlayer:
         self.auto_paused = False
         self._on_destroy = on_destroy
         self._notifier = notifier
+        self._np_factory = now_playing_factory
+        self._now_message: discord.Message | None = None
+        self._now_view: discord.ui.View | None = None
         self._track_added = asyncio.Event()
         self._skip_requested = False
         self._started_at: float | None = None
@@ -172,6 +199,38 @@ class GuildPlayer:
             self._prefetch_next()  # the old head's prefetch is now stale
         return track
 
+    def move(self, from_index: int, to_index: int) -> Track:
+        """Move a queued track to a new index (clamped to the queue's ends)."""
+        track = self.queue[from_index]
+        del self.queue[from_index]
+        self.queue.insert(to_index, track)
+        if from_index == 0 or to_index == 0:
+            self._prefetch_next()  # the head changed in one direction or the other
+        return track
+
+    def shuffle(self) -> None:
+        old_head = self.queue[0] if self.queue else None
+        random.shuffle(self.queue)
+        if self.queue and self.queue[0] is not old_head:
+            self._prefetch_next()
+
+    def clear_queue(self) -> int:
+        """Drop every queued track (the current one keeps playing)."""
+        count = len(self.queue)
+        self.queue.clear()
+        self._prefetch_next()  # cancels the now-stale head prefetch
+        return count
+
+    def remove_where(self, predicate: Callable[[Track], bool]) -> list[Track]:
+        """Remove every queued track matching the predicate; returns them in order."""
+        removed = [t for t in self.queue if predicate(t)]
+        if removed:
+            old_head = self.queue[0]
+            self.queue = deque(t for t in self.queue if not predicate(t))
+            if not self.queue or self.queue[0] is not old_head:
+                self._prefetch_next()
+        return removed
+
     async def wait_closed(self) -> None:
         """Block until destroy() has fully finished (voice disconnected)."""
         await self._closed.wait()
@@ -189,6 +248,7 @@ class GuildPlayer:
             self._empty_task.cancel()
         if self._prefetch_task is not None:
             self._prefetch_task.cancel()
+        await self._clear_now_message()
         try:
             self.voice.stop()
             if self.voice.is_connected():
@@ -293,10 +353,7 @@ class GuildPlayer:
                         self._mark_paused()
                     self._prefetch_next()
                     if not replay:
-                        await self._say(
-                            f"\N{MULTIPLE MUSICAL NOTES} Now playing: {fmt_title(track)} "
-                            f"({fmt_duration(track.duration)}) — requested by {track.requested_by}"
-                        )
+                        await self._announce_now_playing(track)
                     await finished.wait()
                     if self._playback_failed(track, error_slot[0]):
                         track.stream = None
@@ -332,6 +389,9 @@ class GuildPlayer:
                         self.queue.append(track)
                     self.now_playing = None
                     break
+                # The track is over one way or another; its controls must not
+                # outlive it, even if nothing else gets announced.
+                await self._clear_now_message()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -390,6 +450,34 @@ class GuildPlayer:
             "\N{WAVING HAND SIGN} Everyone left the voice channel — disconnecting. Bye!"
         )
         await self.destroy()
+
+    async def _announce_now_playing(self, track: Track) -> None:
+        await self._clear_now_message()
+        if self._np_factory is None:
+            await self._say(
+                f"\N{MULTIPLE MUSICAL NOTES} Now playing: {fmt_title(track)} "
+                f"({fmt_duration(track.duration)}) — requested by {track.requested_by}"
+            )
+            return
+        embed, view = self._np_factory(self)
+        try:
+            self._now_message = await self.text_channel.send(embed=embed, view=view)
+            self._now_view = view
+        except discord.HTTPException:
+            view.stop()
+            log.warning("Could not send now-playing message")
+
+    async def _clear_now_message(self) -> None:
+        """Strip the previous now-playing message's controls, if any."""
+        message, view = self._now_message, self._now_view
+        self._now_message = self._now_view = None
+        if view is not None:
+            view.stop()
+        if message is not None:
+            try:
+                await message.edit(view=None)
+            except discord.HTTPException:
+                pass
 
     async def _say(self, message: str) -> None:
         try:
