@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 import time
 from collections import deque
 from collections.abc import Callable
@@ -11,12 +12,25 @@ from collections.abc import Callable
 import discord
 
 from .notifier import BreakageNotifier
-from .sources import SourceError, Track, fmt_duration, fmt_title, resolve_stream
+from .sources import ResolvedStream, SourceError, Track, fmt_duration, fmt_title, resolve_stream
 
 log = logging.getLogger(__name__)
 
 FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
+
+
+def _before_options(resolved: ResolvedStream) -> str:
+    """ffmpeg input options, including the headers the stream URL was signed for.
+
+    Some YouTube clients 403 requests whose User-Agent doesn't match the one
+    yt-dlp extracted with. discord.py shlex.split()s this string, so the
+    CRLF-joined header blob is quoted to survive as one argument.
+    """
+    if not resolved.http_headers:
+        return FFMPEG_BEFORE_OPTIONS
+    blob = "".join(f"{k}: {v}\r\n" for k, v in resolved.http_headers.items())
+    return f"{FFMPEG_BEFORE_OPTIONS} -headers {shlex.quote(blob)}"
 
 # A track that "finishes" implausibly fast almost certainly hit a dead stream
 # URL: ffmpeg exits on HTTP errors without reporting a playback error, so we
@@ -206,6 +220,7 @@ class GuildPlayer:
 
                 track = self.queue.popleft()
                 replay = False
+                retried = False
                 while not self._destroyed:
                     self.now_playing = track
                     self._started_at = None
@@ -227,8 +242,6 @@ class GuildPlayer:
                         await self._say(f"\N{WARNING SIGN} Skipping {fmt_title(track)}: {exc}")
                         self.now_playing = None
                         break
-                    if self._notifier is not None:
-                        self._notifier.record_success()
 
                     if self._skip_requested:
                         # Skipped while resolving: voice.stop() had nothing to
@@ -260,7 +273,7 @@ class GuildPlayer:
                         source = discord.FFmpegOpusAudio(
                             resolved.url,
                             codec="copy" if resolved.acodec == "opus" else "libopus",
-                            before_options=FFMPEG_BEFORE_OPTIONS,
+                            before_options=_before_options(resolved),
                             options=FFMPEG_OPTIONS,
                         )
                         self.voice.play(source, after=_after)
@@ -287,12 +300,31 @@ class GuildPlayer:
                     await finished.wait()
                     if self._playback_failed(track, error_slot[0]):
                         track.stream = None
+                        if not retried:
+                            # One shot at a fresh extraction: transient 403s
+                            # and dead CDN nodes usually clear on a new URL.
+                            retried = True
+                            replay = True
+                            log.warning(
+                                "Playback of %r failed (%s); retrying with a fresh extraction",
+                                track.title,
+                                error_slot[0] or "early finish",
+                            )
+                            continue
+                        if self._notifier is not None:
+                            await self._notifier.record_failure(self.bot)
                         reason = str(error_slot[0]) if error_slot[0] else "the stream cut out"
                         await self._say(
                             f"\N{WARNING SIGN} Playback of {fmt_title(track)} failed: {reason}"
                         )
                         self.now_playing = None
                         break
+                    if self._notifier is not None:
+                        # Success means audio actually played, not merely that
+                        # extraction returned a URL — a 403'd stream would
+                        # otherwise reset the breakage counter every track.
+                        self._notifier.record_success()
+                    retried = False
                     if self.song_looping and not self._skip_requested:
                         replay = True
                         continue

@@ -79,6 +79,10 @@ class ResolvedStream:
     url: str
     acodec: str | None
     resolved_at: float
+    # Headers yt-dlp would fetch the media URL with (User-Agent and friends).
+    # Some YouTube clients bind the signed URL to them; requests without them
+    # get 403s.
+    http_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -204,18 +208,25 @@ def _track_from_entry(entry: dict, requested_by: str, *, flat: bool = False) -> 
 
 
 def _stream_from_info(info: dict) -> ResolvedStream:
-    """Pick the playable audio URL (and its codec) out of a full extraction."""
+    """Pick the playable audio URL (and its codec/headers) out of a full extraction."""
     url = info.get("url")
     acodec = info.get("acodec")
+    headers = info.get("http_headers")
     if not url:
         for fmt in reversed(info.get("formats") or []):
             if fmt.get("url") and fmt.get("acodec") not in (None, "none"):
                 url = fmt["url"]
                 acodec = fmt.get("acodec")
+                headers = fmt.get("http_headers") or headers
                 break
     if not url:
         raise SourceError("no playable audio stream found")
-    return ResolvedStream(url=url, acodec=acodec, resolved_at=time.monotonic())
+    return ResolvedStream(
+        url=url,
+        acodec=acodec,
+        resolved_at=time.monotonic(),
+        http_headers=dict(headers or {}),
+    )
 
 
 async def search(query: str, source: str, requested_by: str) -> list[Track]:

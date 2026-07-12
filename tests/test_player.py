@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 
 import pytest
 
 from musicbot import player as player_module
 from musicbot.notifier import BreakageNotifier
 from musicbot.player import QueueFullError
-from musicbot.sources import SourceError
+from musicbot.sources import ResolvedStream, SourceError
 
 from .conftest import fake_stream
 
@@ -456,8 +457,13 @@ async def test_playback_error_notifies_and_does_not_requeue(
     player.enqueue(track_factory("Song B"))
 
     voice.finish_track(error=RuntimeError("ffmpeg exploded"))
+    # The first failure retries the same track on a fresh extraction.
     await wait_until(lambda: len(voice.played_sources) == 2)
-    assert voice.played_sources[1] == "stream://Song B"
+    assert voice.played_sources[1] == "stream://Song A"
+
+    voice.finish_track(error=RuntimeError("ffmpeg exploded"))
+    await wait_until(lambda: len(voice.played_sources) == 3)
+    assert voice.played_sources[2] == "stream://Song B"
     assert any("failed" in m and "ffmpeg exploded" in m for m in channel.messages)
     # The broken track must not come back around via the queue loop.
     assert [t.title for t in player.queue] == []
@@ -472,9 +478,92 @@ async def test_playback_error_stops_song_loop(
     player.song_looping = True
 
     voice.finish_track(error=RuntimeError("boom"))
+    await wait_until(lambda: len(voice.played_sources) == 2)  # the one retry
+    voice.finish_track(error=RuntimeError("boom"))
     await wait_until(lambda: player.now_playing is None)
-    assert voice.played_sources == ["stream://Song A"]
+    assert voice.played_sources == ["stream://Song A", "stream://Song A"]
     assert any("failed" in m for m in channel.messages)
+
+
+async def test_playback_failure_retries_once_silently(
+    make_player, voice, channel, track_factory, wait_until
+):
+    calls = []
+
+    async def resolve(track):
+        calls.append(track.title)
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track(error=RuntimeError("403"))
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    # The retry re-resolved (the bad cached URL was dropped) and stayed quiet.
+    assert calls == ["Song A", "Song A"]
+    assert not any("failed" in m for m in channel.messages)
+    assert sum("Now playing" in m for m in channel.messages) == 1
+
+    voice.finish_track()  # the retry plays through to the end
+    await wait_until(lambda: player.now_playing is None)
+    assert not any("failed" in m for m in channel.messages)
+
+
+async def test_double_playback_failure_notifies_owner(
+    make_player, voice, track_factory, wait_until
+):
+    notifier = BreakageNotifier(owner_id=1, threshold=1)
+    player, _ = make_player(notifier=notifier)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track(error=RuntimeError("403"))
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert not player.bot.owner.dms  # a single failure is not breakage
+
+    voice.finish_track(error=RuntimeError("403"))
+    await wait_until(lambda: player.bot.owner.dms)
+    assert "yt-dlp" in player.bot.owner.dms[0]
+
+
+async def test_successful_play_resets_retry_budget(
+    make_player, voice, channel, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.song_looping = True
+
+    voice.finish_track(error=RuntimeError("boom"))  # failure -> retry
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    voice.finish_track()  # retry plays fully; song loop replays
+    await wait_until(lambda: len(voice.played_sources) == 3)
+    voice.finish_track(error=RuntimeError("boom"))  # a fresh retry, not a skip
+    await wait_until(lambda: len(voice.played_sources) == 4)
+    assert not any("failed" in m for m in channel.messages)
+
+
+def test_before_options_without_headers_is_unchanged():
+    resolved = ResolvedStream(url="https://s", acodec="opus", resolved_at=0.0)
+    assert player_module._before_options(resolved) == player_module.FFMPEG_BEFORE_OPTIONS
+
+
+def test_before_options_quotes_headers_as_one_ffmpeg_argument():
+    resolved = ResolvedStream(
+        url="https://s",
+        acodec="opus",
+        resolved_at=0.0,
+        http_headers={"User-Agent": "com.google.android VR/1.61", "Accept": "*/*"},
+    )
+    # discord.py shlex.split()s before_options; the blob must survive as one arg.
+    args = shlex.split(player_module._before_options(resolved))
+    base = shlex.split(player_module.FFMPEG_BEFORE_OPTIONS)
+    assert args[: len(base)] == base
+    assert args[len(base) :] == [
+        "-headers",
+        "User-Agent: com.google.android VR/1.61\r\nAccept: */*\r\n",
+    ]
 
 
 async def test_play_exception_skips_track_but_keeps_player(
@@ -500,6 +589,8 @@ async def test_instant_finish_of_long_track_counts_as_failure(
     await wait_until(lambda: voice.played_sources)
 
     # Dead stream URL: ffmpeg exits almost instantly, no error.
+    voice.finish_track(elapsed=0.1)
+    await wait_until(lambda: len(voice.played_sources) == 2)  # the one retry
     voice.finish_track(elapsed=0.1)
     await wait_until(lambda: player.now_playing is None)
     assert any("failed" in m for m in channel.messages)
@@ -592,6 +683,8 @@ async def test_instant_finish_of_unknown_duration_counts_as_failure(
     await wait_until(lambda: voice.played_sources)
 
     voice.finish_track(elapsed=0.3)  # dead live stream: exits immediately
+    await wait_until(lambda: len(voice.played_sources) == 2)  # the one retry
+    voice.finish_track(elapsed=0.3)
     await wait_until(lambda: player.now_playing is None)
     assert any("failed" in m for m in channel.messages)
 
@@ -616,6 +709,8 @@ async def test_short_track_early_exit_is_failure(
     await wait_until(lambda: voice.played_sources)
 
     # Threshold is duration-relative: min(2s, 5 * 0.5) = 2s.
+    voice.finish_track(elapsed=0.7)
+    await wait_until(lambda: len(voice.played_sources) == 2)  # the one retry
     voice.finish_track(elapsed=0.7)
     await wait_until(lambda: player.now_playing is None)
     assert any("failed" in m for m in channel.messages)

@@ -291,6 +291,49 @@ async def test_resolve_stream_falls_back_to_last_audio_format(monkeypatch, track
     assert resolved.acodec == "mp4a"
 
 
+async def test_resolve_stream_captures_top_level_headers(monkeypatch, track_factory):
+    patch_extract(
+        monkeypatch,
+        {"url": "https://stream", "acodec": "opus", "http_headers": {"User-Agent": "yt-ua"}},
+    )
+    resolved = await sources.resolve_stream(track_factory())
+    assert resolved.http_headers == {"User-Agent": "yt-ua"}
+
+
+async def test_resolve_stream_format_headers_win_over_top_level(monkeypatch, track_factory):
+    patch_extract(
+        monkeypatch,
+        {
+            "http_headers": {"User-Agent": "top-ua"},
+            "formats": [
+                {"url": "https://f1", "acodec": "opus", "http_headers": {"User-Agent": "fmt-ua"}}
+            ],
+        },
+    )
+    resolved = await sources.resolve_stream(track_factory())
+    assert resolved.http_headers == {"User-Agent": "fmt-ua"}
+
+
+async def test_resolve_stream_format_without_headers_falls_back_to_top_level(
+    monkeypatch, track_factory
+):
+    patch_extract(
+        monkeypatch,
+        {
+            "http_headers": {"User-Agent": "top-ua"},
+            "formats": [{"url": "https://f1", "acodec": "opus"}],
+        },
+    )
+    resolved = await sources.resolve_stream(track_factory())
+    assert resolved.http_headers == {"User-Agent": "top-ua"}
+
+
+async def test_resolve_stream_missing_headers_is_empty_dict(monkeypatch, track_factory):
+    patch_extract(monkeypatch, {"url": "https://stream", "acodec": "opus"})
+    resolved = await sources.resolve_stream(track_factory())
+    assert resolved.http_headers == {}
+
+
 async def test_resolve_stream_no_audio_raises(monkeypatch, track_factory):
     patch_extract(monkeypatch, {"formats": [{"url": "https://video", "acodec": "none"}]})
     with pytest.raises(SourceError):
