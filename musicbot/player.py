@@ -18,11 +18,17 @@ log = logging.getLogger(__name__)
 FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
 
-# A track that "finishes" this fast (while claiming to be much longer) almost
-# certainly hit a dead stream URL: ffmpeg exits on HTTP errors without
-# reporting a playback error, so we detect it by elapsed time.
+# A track that "finishes" implausibly fast almost certainly hit a dead stream
+# URL: ffmpeg exits on HTTP errors without reporting a playback error, so we
+# detect it by elapsed time relative to the advertised duration.
 SUSPICIOUS_FINISH_SECONDS = 2.0
-SUSPICIOUS_MIN_DURATION = 10
+
+# Hard cap on queued tracks per guild.
+MAX_QUEUE_SIZE = 500
+
+
+class QueueFullError(Exception):
+    """The guild's queue is at MAX_QUEUE_SIZE."""
 
 
 class GuildPlayer:
@@ -55,13 +61,17 @@ class GuildPlayer:
         self._paused_at: float | None = None
         self._empty_task: asyncio.Task | None = None
         self._prefetch_task: asyncio.Task | None = None
+        self._prefetch_track: Track | None = None
         self._destroyed = False
+        self._closed = asyncio.Event()
         self._task = bot.loop.create_task(self._player_loop())
 
     # -- public API ----------------------------------------------------
 
     def enqueue(self, track: Track, front: bool = False) -> int:
         """Add a track and return its 1-based position in the upcoming queue."""
+        if len(self.queue) >= MAX_QUEUE_SIZE:
+            raise QueueFullError
         if front:
             self.queue.appendleft(track)
         else:
@@ -90,6 +100,15 @@ class GuildPlayer:
         return time.monotonic() - self._started_at
 
     def skip(self) -> None:
+        if self.now_playing is None:
+            # Nothing current: the head of the queue is what "skip" means, and
+            # _skip_requested would be reset by the loop before it could act.
+            if self.queue:
+                track = self.queue.popleft()
+                if self.queue_looping:
+                    self.queue.append(track)
+                self._prefetch_next()
+            return
         self._skip_requested = True
         self.voice.stop()
 
@@ -135,7 +154,13 @@ class GuildPlayer:
     def remove_at(self, index: int) -> Track:
         track = self.queue[index]
         del self.queue[index]
+        if index == 0:
+            self._prefetch_next()  # the old head's prefetch is now stale
         return track
+
+    async def wait_closed(self) -> None:
+        """Block until destroy() has fully finished (voice disconnected)."""
+        await self._closed.wait()
 
     async def destroy(self) -> None:
         """Tear everything down: queue, playback, voice connection."""
@@ -157,6 +182,7 @@ class GuildPlayer:
         except Exception:
             log.exception("Error while disconnecting voice")
         self._on_destroy()
+        self._closed.set()
 
     # -- internals -----------------------------------------------------
 
@@ -171,6 +197,10 @@ class GuildPlayer:
                         await self._say(
                             "\N{WAVING HAND SIGN} Nothing has played for a while — disconnecting."
                         )
+                        # A track may have arrived while that message was in
+                        # flight; it must play rather than be destroyed.
+                        if self.queue or self._track_added.is_set():
+                            continue
                         break
                     continue
 
@@ -178,8 +208,15 @@ class GuildPlayer:
                 replay = False
                 while not self._destroyed:
                     self.now_playing = track
+                    self._started_at = None
+                    self._paused_at = None
                     self._skip_requested = False
                     self.skip_votes.clear()
+                    if self._prefetch_task is not None and self._prefetch_track is track:
+                        # Let an in-flight prefetch finish instead of racing it
+                        # with a duplicate extraction; resolve_stream then hits
+                        # its cache (or reports the failure properly).
+                        await asyncio.wait({self._prefetch_task})
                     try:
                         # Re-checked on every replay too; cached results are
                         # reused while fresh, re-extracted once they expire.
@@ -235,6 +272,12 @@ class GuildPlayer:
                         break
                     self._started_at = time.monotonic()
                     self._paused_at = None
+                    if self._empty_task is not None and not self._empty_task.done():
+                        # Everyone left while this track was resolving: don't
+                        # play to an empty room. Occupancy events resume it.
+                        self.voice.pause()
+                        self.auto_paused = True
+                        self._mark_paused()
                     self._prefetch_next()
                     if not replay:
                         await self._say(
@@ -269,24 +312,28 @@ class GuildPlayer:
         """Whether the track's end should be treated as a playback failure.
 
         ffmpeg exits silently (no error) on dead/expired stream URLs, so an
-        implausibly early finish counts as a failure too.
+        implausibly early finish — relative to the advertised duration, when
+        known — counts as a failure too.
         """
         if self._destroyed or self._skip_requested:
             return False
         if error is not None:
             return True
         position = self.position
-        return (
-            position is not None
-            and position < SUSPICIOUS_FINISH_SECONDS
-            and (track.duration or 0) >= SUSPICIOUS_MIN_DURATION
-        )
+        if position is None:
+            return False
+        if track.duration:
+            threshold = min(SUSPICIOUS_FINISH_SECONDS, track.duration * 0.5)
+        else:
+            threshold = SUSPICIOUS_FINISH_SECONDS
+        return position < threshold
 
     def _prefetch_next(self) -> None:
         """Resolve the upcoming track's stream while the current one plays."""
         if self._prefetch_task is not None:
             self._prefetch_task.cancel()
             self._prefetch_task = None
+            self._prefetch_track = None
         if not self.queue:
             return
         next_track = self.queue[0]
@@ -299,6 +346,7 @@ class GuildPlayer:
             except Exception:
                 log.exception("Prefetch failed")
 
+        self._prefetch_track = next_track
         self._prefetch_task = self.bot.loop.create_task(prefetch())
 
     async def _empty_channel_timer(self) -> None:

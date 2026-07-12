@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from musicbot import player as player_module
 from musicbot.notifier import BreakageNotifier
+from musicbot.player import QueueFullError
 from musicbot.sources import SourceError
 
 from .conftest import fake_stream
@@ -495,7 +499,8 @@ async def test_instant_finish_of_long_track_counts_as_failure(
     player.enqueue(track_factory("Song A", duration=180))
     await wait_until(lambda: voice.played_sources)
 
-    voice.finish_track()  # dead stream URL: ffmpeg exits instantly, no error
+    # Dead stream URL: ffmpeg exits almost instantly, no error.
+    voice.finish_track(elapsed=0.1)
     await wait_until(lambda: player.now_playing is None)
     assert any("failed" in m for m in channel.messages)
     assert [t.title for t in player.queue] == []
@@ -519,3 +524,223 @@ async def test_prefetch_resolves_next_track_while_playing(
     # Song B was resolved while Song A is still playing.
     assert voice.played_sources == ["stream://Song A"]
     assert player.now_playing.title == "Song A"
+
+
+async def test_queue_cap_rejects_overflow(make_player, track_factory, monkeypatch):
+    monkeypatch.setattr(player_module, "MAX_QUEUE_SIZE", 2)
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    player.enqueue(track_factory("Song B"))
+    with pytest.raises(QueueFullError):
+        player.enqueue(track_factory("Song C"))
+    assert len(player.queue) == 2
+
+
+async def test_track_enqueued_during_idle_goodbye_still_plays(
+    make_player, voice, channel, track_factory, wait_until
+):
+    """The idle timer's goodbye message must not eat a just-enqueued track."""
+    gate = asyncio.Event()
+    saying_goodbye = asyncio.Event()
+    original_send = channel.send
+
+    async def slow_send(content=None, **kwargs):
+        if content and "disconnecting" in content.lower():
+            saying_goodbye.set()
+            await gate.wait()
+        await original_send(content, **kwargs)
+
+    channel.send = slow_send
+    player, destroyed = make_player(idle_timeout=0.05)
+
+    await saying_goodbye.wait()
+    player.enqueue(track_factory("Song A"))  # arrives mid-goodbye
+    gate.set()
+
+    await wait_until(lambda: voice.played_sources)
+    assert voice.played_sources == ["stream://Song A"]
+    assert destroyed == []
+
+
+async def test_skip_before_loop_picks_up_track_removes_it(make_player, voice, track_factory):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    # Nothing is current yet: the loop hasn't run. A skip must take the
+    # queued head with it instead of arming a flag the loop resets.
+    player.skip()
+    assert not player.queue
+
+    await asyncio.sleep(0.05)
+    assert voice.played_sources == []
+
+
+async def test_skip_before_loop_requeues_when_queue_looping(make_player, track_factory):
+    player, _ = make_player()
+    player.queue_looping = True
+    player.enqueue(track_factory("Song A"))
+    player.enqueue(track_factory("Song B"))
+
+    player.skip()
+    assert [t.title for t in player.queue] == ["Song B", "Song A"]
+
+
+async def test_instant_finish_of_unknown_duration_counts_as_failure(
+    make_player, voice, channel, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Live Stream", duration=None))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track(elapsed=0.3)  # dead live stream: exits immediately
+    await wait_until(lambda: player.now_playing is None)
+    assert any("failed" in m for m in channel.messages)
+
+
+async def test_unknown_duration_long_play_is_not_failure(
+    make_player, voice, channel, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Live Stream", duration=None))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track(elapsed=30.0)
+    await wait_until(lambda: player.now_playing is None)
+    assert not any("failed" in m for m in channel.messages)
+
+
+async def test_short_track_early_exit_is_failure(
+    make_player, voice, channel, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Short", duration=5))
+    await wait_until(lambda: voice.played_sources)
+
+    # Threshold is duration-relative: min(2s, 5 * 0.5) = 2s.
+    voice.finish_track(elapsed=0.7)
+    await wait_until(lambda: player.now_playing is None)
+    assert any("failed" in m for m in channel.messages)
+
+
+async def test_very_short_clip_full_play_is_not_failure(
+    make_player, voice, channel, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Blip", duration=1))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track(elapsed=1.0)  # legit: played its full 1s
+    await wait_until(lambda: player.now_playing is None)
+    assert not any("failed" in m for m in channel.messages)
+
+
+async def test_position_is_cleared_while_next_track_resolves(
+    make_player, voice, track_factory, wait_until
+):
+    gate = asyncio.Event()
+
+    async def resolve(track):
+        if track.title == "Song B" and not gate.is_set():
+            await gate.wait()
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+
+    voice.finish_track()
+    # Song B becomes current but is stuck resolving: no stale elapsed time
+    # left over from Song A.
+    await wait_until(
+        lambda: player.now_playing is not None and player.now_playing.title == "Song B"
+    )
+    assert player.position is None
+    gate.set()
+
+
+async def test_wait_closed_completes_after_destroy(make_player, track_factory):
+    player, _ = make_player()
+    waiter = asyncio.ensure_future(player.wait_closed())
+    await asyncio.sleep(0.01)
+    assert not waiter.done()
+
+    await player.destroy()
+    await asyncio.wait_for(waiter, timeout=1)
+
+
+async def test_removing_queue_head_retargets_prefetch(
+    make_player, voice, track_factory, wait_until
+):
+    calls = []
+
+    async def resolve(track):
+        calls.append(track.title)
+        return fake_stream(track)
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))
+    player.enqueue(track_factory("Song C"))
+    await wait_until(lambda: "Song B" in calls)
+
+    removed = player.remove_at(0)
+    assert removed.title == "Song B"
+    # The prefetch now aims at the new head.
+    await wait_until(lambda: "Song C" in calls)
+    assert player._prefetch_track.title == "Song C"
+
+
+async def test_foreground_resolve_waits_for_inflight_prefetch(
+    make_player, voice, track_factory, wait_until
+):
+    active = 0
+    max_active = 0
+
+    async def resolve(track):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            if track.title == "Song B":
+                await asyncio.sleep(0.05)
+            return fake_stream(track)
+        finally:
+            active -= 1
+
+    player, _ = make_player(resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+    player.enqueue(track_factory("Song B"))  # prefetch of B starts (slow)
+
+    voice.finish_track()  # loop reaches B while its prefetch is in flight
+    await wait_until(lambda: len(voice.played_sources) == 2)
+    assert max_active == 1  # never two concurrent resolutions
+
+
+async def test_channel_emptying_during_resolve_pauses_playback(
+    make_player, voice, track_factory, wait_until
+):
+    gate = asyncio.Event()
+    resolving = asyncio.Event()
+
+    async def resolve(track):
+        if not gate.is_set():
+            resolving.set()
+            await gate.wait()
+        return fake_stream(track)
+
+    player, _ = make_player(idle_timeout=60, resolve=resolve)
+    player.enqueue(track_factory("Song A"))
+
+    await resolving.wait()
+    player.channel_became_empty()  # everyone left while resolving
+    gate.set()
+
+    await wait_until(lambda: voice.played_sources)
+    await wait_until(lambda: voice.paused)
+    assert player.auto_paused
+
+    player.channel_became_occupied()
+    assert not voice.paused
+    assert not player.auto_paused

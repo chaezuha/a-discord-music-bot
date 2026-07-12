@@ -8,7 +8,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from musicbot.music import Music
+from musicbot.music import Music, env_id, env_idle_timeout
 
 log = logging.getLogger("bot")
 
@@ -53,8 +53,12 @@ def main() -> None:
             "https://discord.com/developers/applications"
         )
 
-    dev_guild_raw = os.getenv("DEV_GUILD_ID", "").strip()
-    dev_guild_id = int(dev_guild_raw) if dev_guild_raw else None
+    try:
+        dev_guild_id = env_id("DEV_GUILD_ID")
+        env_id("OWNER_ID")  # validated here for a clear startup error
+        env_idle_timeout()
+    except ValueError as exc:
+        sys.exit(f"Configuration error: {exc}")
 
     bot = MusicBot(dev_guild_id=dev_guild_id)
     bot.run(token, log_level=logging.INFO, root_logger=True)

@@ -6,12 +6,18 @@ import pytest
 
 from musicbot import sources
 from musicbot.sources import (
+    DEFAULT_ALLOWED_DOMAINS,
+    ERROR_DISPLAY_LIMIT,
+    TITLE_DISPLAY_LIMIT,
     SourceError,
     _clean_error,
     _first_entry,
+    _parse_allowed_domains,
+    check_url_allowed,
     fmt_duration,
     fmt_title,
     is_url,
+    truncate,
 )
 
 
@@ -73,6 +79,32 @@ def test_clean_error_strips_prefix():
     assert _clean_error(Exception("")) == "unknown extraction error"
 
 
+def test_clean_error_truncates_long_messages():
+    cleaned = _clean_error(Exception("x" * (ERROR_DISPLAY_LIMIT + 100)))
+    assert len(cleaned) == ERROR_DISPLAY_LIMIT
+    assert cleaned.endswith("…")
+
+
+def test_truncate_passthrough_and_ellipsis():
+    assert truncate("short", 10) == "short"
+    assert truncate("x" * 10, 10) == "x" * 10
+    clipped = truncate("word " * 20, 12)
+    assert len(clipped) <= 12
+    assert clipped.endswith("…")
+
+
+def test_fmt_title_truncates_before_escaping(track_factory):
+    # A pile of Markdown characters right at the cut point: escaping after
+    # truncation means no escape sequence can be sliced in half.
+    title = "a" * (TITLE_DISPLAY_LIMIT - 1) + "*" * 50
+    track = track_factory(title, webpage_url="")
+    rendered = fmt_title(track)
+    assert rendered.startswith("**")
+    assert "*" * 50 not in rendered
+    assert "\\" + "…" not in rendered  # the ellipsis is never escaped
+    assert "…" in rendered
+
+
 def test_first_entry_unwraps_nested_playlists():
     info = {"entries": [{"entries": [{"title": "deep"}, {"title": "ignored"}]}]}
     assert _first_entry(info) == {"title": "deep"}
@@ -83,6 +115,72 @@ def test_first_entry_rejects_empty_playlists():
         _first_entry({"entries": []})
     with pytest.raises(SourceError):
         _first_entry({"entries": [None]})
+
+
+# -- URL allowlist ----------------------------------------------------------
+
+
+def test_parse_allowed_domains_semantics():
+    assert _parse_allowed_domains(None) == DEFAULT_ALLOWED_DOMAINS
+    assert _parse_allowed_domains("") == DEFAULT_ALLOWED_DOMAINS
+    assert _parse_allowed_domains("*") is None
+    # A list replaces the defaults entirely.
+    assert _parse_allowed_domains("Vimeo.com, .archive.org") == {"vimeo.com", "archive.org"}
+    with pytest.raises(ValueError):
+        _parse_allowed_domains(" , ,")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://youtube.com/watch?v=abc",
+        "https://www.youtube.com/watch?v=abc",
+        "https://music.youtube.com/watch?v=abc",
+        "https://youtu.be/abc",
+        "https://soundcloud.com/artist/track",
+        "https://artist.bandcamp.com/track/x",
+    ],
+)
+def test_default_allowlist_accepts_known_sites(url):
+    check_url_allowed(url)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/video",
+        "https://notyoutube.com/watch?v=abc",  # suffix match must not be fooled
+        "https://youtube.com.evil.example/watch",
+        "https://user:pass@youtube.com/watch?v=abc",  # embedded credentials
+        "http://127.0.0.1:8080/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+        "http://10.0.0.5/stream",
+        "https:///nohost",
+    ],
+)
+def test_default_allowlist_rejects(url):
+    with pytest.raises(SourceError):
+        check_url_allowed(url)
+
+
+def test_wildcard_disables_allowlist(monkeypatch):
+    monkeypatch.setattr(sources, "ALLOWED_DOMAINS", None)
+    check_url_allowed("http://127.0.0.1/anything")  # must not raise
+
+
+def test_custom_allowlist_replaces_defaults(monkeypatch):
+    monkeypatch.setattr(sources, "ALLOWED_DOMAINS", frozenset({"vimeo.com"}))
+    check_url_allowed("https://vimeo.com/12345")
+    with pytest.raises(SourceError):
+        check_url_allowed("https://youtube.com/watch?v=abc")
+
+
+async def test_fetch_track_enforces_allowlist(monkeypatch):
+    calls = patch_extract(monkeypatch, {"title": "Song"})
+    with pytest.raises(SourceError):
+        await sources.fetch_track("https://evil.example/x", requested_by="me")
+    assert calls == []  # rejected before any extraction
 
 
 # -- search ---------------------------------------------------------------
@@ -126,13 +224,17 @@ async def test_search_maps_entries_with_fallbacks(monkeypatch):
 # -- fetch_track ----------------------------------------------------------
 
 
+VIDEO_URL = "https://youtube.com/watch?v=abc"
+PLAYLIST_URL = "https://youtube.com/playlist?list=xyz"
+
+
 async def test_fetch_track_single_video(monkeypatch):
     calls = patch_extract(
         monkeypatch,
         {"title": "Song", "webpage_url": "https://w", "duration": 42, "uploader": "U"},
     )
-    track = await sources.fetch_track("https://w", requested_by="me")
-    assert calls == [("https://w", False)]
+    track = await sources.fetch_track(VIDEO_URL, requested_by="me")
+    assert calls == [(VIDEO_URL, False)]
     assert (track.title, track.webpage_url, track.duration) == ("Song", "https://w", 42)
 
 
@@ -141,14 +243,25 @@ async def test_fetch_track_unwraps_playlist_url(monkeypatch):
         monkeypatch,
         {"entries": [{"title": "First", "webpage_url": "https://first"}, {"title": "Second"}]},
     )
-    track = await sources.fetch_track("https://playlist", requested_by="me")
+    track = await sources.fetch_track(PLAYLIST_URL, requested_by="me")
     assert track.title == "First"
 
 
 async def test_fetch_track_empty_playlist_raises(monkeypatch):
     patch_extract(monkeypatch, {"entries": []})
     with pytest.raises(SourceError):
-        await sources.fetch_track("https://playlist", requested_by="me")
+        await sources.fetch_track(PLAYLIST_URL, requested_by="me")
+
+
+async def test_fetch_track_never_uses_media_url_as_display_link(monkeypatch):
+    # A full extraction's "url" can be a signed media URL; it must not leak
+    # into the track's webpage_url (which gets embedded in chat).
+    patch_extract(
+        monkeypatch,
+        {"title": "Song", "url": "https://cdn.example/signed?token=secret", "acodec": "opus"},
+    )
+    track = await sources.fetch_track(VIDEO_URL, requested_by="me")
+    assert track.webpage_url == ""
 
 
 # -- resolve_stream -------------------------------------------------------
@@ -215,7 +328,7 @@ async def test_fetch_track_prepopulates_stream_cache(monkeypatch):
             "acodec": "opus",
         },
     )
-    track = await sources.fetch_track("https://w", requested_by="me")
+    track = await sources.fetch_track(VIDEO_URL, requested_by="me")
     assert track.stream is not None
     assert track.stream.url == "https://stream"
     # Playback's resolve should now be free.

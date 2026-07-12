@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 
 import discord
 
 from .sources import Track, fmt_duration
+
+log = logging.getLogger(__name__)
 
 OnPick = Callable[[discord.Interaction, Track], Awaitable[None]]
 
@@ -47,6 +50,23 @@ class SearchPicker(discord.ui.View):
         track = self.tracks[int(self.select.values[0])]
         self.stop()
         await self.on_pick(interaction, track)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        """Backstop: never leave the picker (or a deferred pick) hanging."""
+        log.error("Search picker failed", exc_info=error)
+        content = "\N{WARNING SIGN} Something went wrong with that pick."
+        try:
+            if interaction.response.is_done():
+                await interaction.edit_original_response(content=content, view=None)
+            else:
+                await interaction.response.edit_message(content=content, view=None)
+        except discord.HTTPException:
+            pass
 
     async def on_timeout(self) -> None:
         if self.message:

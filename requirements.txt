@@ -1,3 +1,8 @@
+# Note: discord.py currently pins pynacl<1.6, which keeps PyNaCl on a version
+# flagged by CVE-2025-69277. Discord voice doesn't use the affected Ed25519
+# path (see the pip-audit ignore in CI); revisit when discord.py lifts the pin.
 discord.py[voice]>=2.4
-yt-dlp>=2025.1.1
+# [default] pulls in yt-dlp-ejs, required for full YouTube support alongside a
+# JavaScript runtime such as Deno (https://github.com/yt-dlp/yt-dlp/wiki/EJS).
+yt-dlp[default]>=2025.11.12
 python-dotenv>=1.0

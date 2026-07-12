@@ -61,3 +61,46 @@ async def test_no_owner_never_dms(fake_now):
     for _ in range(5):
         await notifier.record_failure(bot)
     assert bot.owner.dms == []
+
+
+async def test_failed_dm_rolls_back_cooldown(notifier, fake_now):
+    import discord
+
+    bot = FakeBot()
+
+    async def failing_send(content):
+        raise discord.HTTPException(
+            __import__("types").SimpleNamespace(status=500, reason="boom"), "boom"
+        )
+
+    bot.owner.send = failing_send
+    for _ in range(3):
+        await notifier.record_failure(bot)
+
+    # The failed DM must not consume the cooldown: restore delivery and the
+    # very next failure should DM immediately.
+    working = FakeBot()
+    await notifier.record_failure(working)
+    assert len(working.owner.dms) == 1
+
+
+async def test_concurrent_failures_send_single_dm(notifier):
+    import asyncio
+
+    bot = FakeBot()
+    gate = asyncio.Event()
+    dms = []
+
+    async def slow_send(content):
+        await gate.wait()
+        dms.append(content)
+
+    bot.owner.send = slow_send
+    notifier.failures = 2  # next failure crosses the threshold
+
+    first = asyncio.ensure_future(notifier.record_failure(bot))
+    second = asyncio.ensure_future(notifier.record_failure(bot))
+    await asyncio.sleep(0.01)
+    gate.set()
+    await asyncio.gather(first, second)
+    assert len(dms) == 1

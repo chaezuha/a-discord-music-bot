@@ -4,6 +4,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Deno: the JavaScript runtime yt-dlp needs for full YouTube support
+# (https://github.com/yt-dlp/yt-dlp/wiki/EJS).
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
 COPY requirements.txt .

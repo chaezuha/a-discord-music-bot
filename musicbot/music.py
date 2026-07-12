@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import logging
+import math
 import os
 
 import discord
@@ -13,13 +14,24 @@ from discord.ext import commands
 
 from . import sources
 from .notifier import BreakageNotifier
-from .player import GuildPlayer
-from .sources import SourceError, Track, fmt_duration, fmt_title, is_url
+from .player import MAX_QUEUE_SIZE, GuildPlayer, QueueFullError
+from .sources import (
+    TITLE_DISPLAY_LIMIT,
+    SourceError,
+    Track,
+    fmt_duration,
+    fmt_title,
+    is_url,
+    truncate,
+)
 from .ui import SearchPicker
 
 log = logging.getLogger(__name__)
 
 QUEUE_PAGE_SIZE = 15
+MAX_QUERY_LENGTH = 500
+EMBED_DESCRIPTION_LIMIT = 4096
+DESTROY_WAIT_SECONDS = 10
 
 esc = discord.utils.escape_markdown
 
@@ -38,23 +50,62 @@ def votes_needed(listener_count: int) -> int:
     return max(1, (listener_count + 1) // 2)
 
 
+def env_id(name: str) -> int | None:
+    """Parse an optional Discord-ID environment variable with a clear error."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a numeric Discord ID, got {raw!r}.") from None
+
+
+def env_idle_timeout(default: float = 180.0) -> float:
+    """Parse IDLE_TIMEOUT_SECONDS: a finite, positive number of seconds."""
+    raw = (os.getenv("IDLE_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"IDLE_TIMEOUT_SECONDS must be a number of seconds, got {raw!r}."
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"IDLE_TIMEOUT_SECONDS must be a finite, positive number of seconds, got {raw!r}."
+        )
+    return value
+
+
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.players: dict[int, GuildPlayer] = {}
         self._player_locks: dict[int, asyncio.Lock] = {}
-        self.idle_timeout = float(os.getenv("IDLE_TIMEOUT_SECONDS") or 180)
-        owner_raw = (os.getenv("OWNER_ID") or "").strip()
-        self.notifier = BreakageNotifier(int(owner_raw) if owner_raw else None)
+        self.idle_timeout = env_idle_timeout()
+        self.notifier = BreakageNotifier(env_id("OWNER_ID"))
+
+    async def cog_unload(self) -> None:
+        await asyncio.gather(
+            *(player.destroy() for player in list(self.players.values())),
+            return_exceptions=True,
+        )
 
     # -- helpers ---------------------------------------------------------
 
+    @staticmethod
+    def _require_voice(interaction: discord.Interaction) -> discord.abc.Connectable:
+        """The caller's current voice channel, or a UserError."""
+        voice = getattr(interaction.user, "voice", None)
+        if voice is None or voice.channel is None:
+            raise UserError("Join a voice channel first, then try again.")
+        return voice.channel
+
     async def _ensure_player(self, interaction: discord.Interaction) -> GuildPlayer:
         """Get or create the guild's player, joining the caller's voice channel."""
-        user = interaction.user
-        if not isinstance(user, discord.Member) or user.voice is None or user.voice.channel is None:
-            raise UserError("Join a voice channel first, then try again.")
-        channel = user.voice.channel
+        channel = self._require_voice(interaction)
         guild_id = interaction.guild_id
 
         # Serialized per guild: concurrent /play calls must not double-connect,
@@ -63,7 +114,12 @@ class Music(commands.Cog):
         async with lock:
             player = self.players.get(guild_id)
             if player is not None and player.destroyed:
-                # destroy() is in flight; its removal callback hasn't run yet.
+                # destroy() is in flight; wait for its disconnect to finish so
+                # the new voice connection can't race it.
+                try:
+                    await asyncio.wait_for(player.wait_closed(), timeout=DESTROY_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    log.warning("Timed out waiting for player teardown in guild %s", guild_id)
                 self._remove_player(guild_id, player)
                 player = None
             if player is not None:
@@ -73,6 +129,8 @@ class Music(commands.Cog):
                             f"I'm already playing in {player.voice.channel.mention} — join me there."
                         )
                     await player.voice.move_to(channel)
+                # Announcements follow the channel of the latest command.
+                player.text_channel = interaction.channel
                 return player
 
             voice = await channel.connect(self_deaf=True)
@@ -107,7 +165,10 @@ class Music(commands.Cog):
 
     def _enqueue(self, player: GuildPlayer, track: Track, front: bool = False) -> str:
         was_active = player.is_active
-        position = player.enqueue(track, front=front)
+        try:
+            position = player.enqueue(track, front=front)
+        except QueueFullError:
+            raise UserError(f"The queue is full (max {MAX_QUEUE_SIZE} tracks).") from None
         if was_active or position > 1:
             if front:
                 return (
@@ -128,10 +189,14 @@ class Music(commands.Cog):
         await interaction.response.defer()
         try:
             player = await self._ensure_player(interaction)
+            message = self._enqueue(player, track, front=front)
         except UserError as exc:
-            await interaction.edit_original_response(content=str(exc), view=None)
-            return
-        message = self._enqueue(player, track, front=front)
+            message = str(exc)
+        except Exception:
+            # View callbacks don't reach cog_app_command_error; without this
+            # the deferred response would spin forever.
+            log.exception("Failed to queue picked track")
+            message = "Something went wrong queueing that track."
         await interaction.edit_original_response(content=message, view=None)
 
     async def _play_impl(
@@ -142,22 +207,35 @@ class Music(commands.Cog):
         *,
         front: bool,
     ) -> None:
+        # Cheap gates before any yt-dlp work: the caller must be in voice
+        # (re-checked by _ensure_player after extraction) and the query sane.
+        self._require_voice(interaction)
+        query = query.strip()
+        if not query:
+            raise UserError("Give me something to play — a URL or words to search for.")
+        if len(query) > MAX_QUERY_LENGTH:
+            raise UserError(f"That query is too long (max {MAX_QUERY_LENGTH} characters).")
+
         await interaction.response.defer()
-        requested_by = interaction.user.display_name
+        requested_by = esc(interaction.user.display_name)
 
         if is_url(query):
-            try:
-                track = await sources.fetch_track(query, requested_by=requested_by)
-            except SourceError:
-                await self.notifier.record_failure(self.bot)
-                raise
-            self.notifier.record_success()
+            # Failures here don't feed the breakage notifier: user-typed URLs
+            # are typo-prone and deliberately triggerable.
+            track = await sources.fetch_track(query, requested_by=requested_by)
             player = await self._ensure_player(interaction)
             await interaction.followup.send(self._enqueue(player, track, front=front))
             return
 
         source_key = source.value if source else "youtube"
-        tracks = await sources.search(query, source_key, requested_by=requested_by)
+        try:
+            tracks = await sources.search(query, source_key, requested_by=requested_by)
+        except SourceError:
+            # A bot-formed search against a known-good site failing is a real
+            # breakage signal, unlike an arbitrary user-typed URL.
+            await self.notifier.record_failure(self.bot)
+            raise
+        self.notifier.record_success()
         if not tracks:
             await interaction.followup.send(f"No results found for **{esc(query)}**.")
             return
@@ -208,17 +286,31 @@ class Music(commands.Cog):
     @app_commands.command(description="Stop playback, clear the queue, and disconnect")
     @app_commands.guild_only()
     async def stop(self, interaction: discord.Interaction) -> None:
-        player = self.players.get(interaction.guild_id)
-        if player is None and interaction.guild.voice_client is None:
+        if (
+            self.players.get(interaction.guild_id) is None
+            and interaction.guild.voice_client is None
+        ):
             raise UserError("I'm not connected to a voice channel.")
-        if player is not None:
-            self._require_same_channel(interaction, player)
         # Disconnecting can outlast Discord's 3s ack deadline; ack first.
         await interaction.response.defer()
-        if player is not None:
-            await player.destroy()
-        else:
-            await interaction.guild.voice_client.disconnect(force=True)
+        # Same lock as _ensure_player: a concurrent /play must not connect or
+        # enqueue into a player that is mid-teardown. State is re-read under
+        # the lock because it may have changed while deferring.
+        lock = self._player_locks.setdefault(interaction.guild_id, asyncio.Lock())
+        async with lock:
+            player = self.players.get(interaction.guild_id)
+            voice_client = interaction.guild.voice_client
+            if player is None and voice_client is None:
+                raise UserError("I'm not connected to a voice channel.")
+            bot_channel = player.voice.channel if player is not None else voice_client.channel
+            caller_voice = getattr(interaction.user, "voice", None)
+            if caller_voice is None or caller_voice.channel != bot_channel:
+                raise UserError("Join my voice channel to use that command.")
+            if player is not None:
+                await player.destroy()
+            else:
+                # Orphaned voice client (no player): disconnect it directly.
+                await voice_client.disconnect(force=True)
         await interaction.followup.send(
             "\N{BLACK SQUARE FOR STOP} Stopped playback and cleared the queue. Bye!"
         )
@@ -262,20 +354,33 @@ class Music(commands.Cog):
         ):
             raise UserError("Join my voice channel to vote to skip.")
 
-        listeners = [m for m in channel.members if not m.bot]
-        needed = votes_needed(len(listeners))
-        player.skip_votes &= {m.id for m in listeners}
-        if user.id in player.skip_votes:
-            raise UserError(f"You already voted — {len(player.skip_votes)}/{needed} votes to skip.")
-        player.skip_votes.add(user.id)
-
-        if len(player.skip_votes) >= needed:
+        listener_ids = {m.id for m in channel.members if not m.bot}
+        passed, already_voted, needed = self._tally_skip_vote(player, user.id, listener_ids)
+        if passed:
             verb = "Vote passed — skipped" if needed > 1 else "Skipped"
             await interaction.response.send_message(self._do_skip(player, verb))
+        elif already_voted:
+            raise UserError(f"You already voted — {len(player.skip_votes)}/{needed} votes to skip.")
         else:
             await interaction.response.send_message(
                 f"Vote to skip: **{len(player.skip_votes)}/{needed}** — `/skip` to add your vote."
             )
+
+    @staticmethod
+    def _tally_skip_vote(
+        player: GuildPlayer, voter_id: int, listener_ids: set[int]
+    ) -> tuple[bool, bool, int]:
+        """Prune departed voters and register this vote.
+
+        Returns (passed, already_voted, needed). The threshold is evaluated
+        even for a repeat vote: listeners leaving can turn the existing votes
+        into a majority.
+        """
+        needed = votes_needed(len(listener_ids))
+        player.skip_votes &= listener_ids
+        already_voted = voter_id in player.skip_votes
+        player.skip_votes.add(voter_id)
+        return len(player.skip_votes) >= needed, already_voted, needed
 
     @app_commands.command(description="Skip the current track immediately, no vote")
     @app_commands.guild_only()
@@ -320,17 +425,14 @@ class Music(commands.Cog):
                 f"**Now playing:** {fmt_title(track)} ({self._fmt_progress(player, track)})"
                 f"{marker} — requested by {track.requested_by}\n"
             )
-        for i, track in enumerate(list(player.queue)[:QUEUE_PAGE_SIZE], start=1):
-            lines.append(
-                f"`{i}.` {fmt_title(track)} ({fmt_duration(track.duration)}) — {track.requested_by}"
-            )
-        remaining = len(player.queue) - QUEUE_PAGE_SIZE
-        if remaining > 0:
-            lines.append(f"…and {remaining} more")
+        queue_lines = [
+            f"`{i}.` {fmt_title(track)} ({fmt_duration(track.duration)}) — {track.requested_by}"
+            for i, track in enumerate(list(player.queue)[:QUEUE_PAGE_SIZE], start=1)
+        ]
 
         embed = discord.Embed(
             title="\N{MULTIPLE MUSICAL NOTES} Queue",
-            description="\n".join(lines),
+            description=self._queue_description(lines, queue_lines, len(player.queue)),
             color=discord.Color.blurple(),
         )
         if player.queue_looping:
@@ -339,6 +441,24 @@ class Music(commands.Cog):
                 "Queue loop is on — finished tracks return to the end."
             )
         await interaction.response.send_message(embed=embed)
+
+    @staticmethod
+    def _queue_description(head_lines: list[str], queue_lines: list[str], queue_size: int) -> str:
+        """Assemble the queue embed body, dropping whole lines to fit the limit."""
+        hidden = queue_size - len(queue_lines)
+
+        def build() -> str:
+            parts = head_lines + queue_lines
+            if hidden > 0:
+                parts.append(f"…and {hidden} more")
+            return "\n".join(parts)
+
+        description = build()
+        while queue_lines and len(description) > EMBED_DESCRIPTION_LIMIT:
+            queue_lines.pop()
+            hidden += 1
+            description = build()
+        return truncate(description, EMBED_DESCRIPTION_LIMIT)
 
     @staticmethod
     def _fmt_progress(player: GuildPlayer, track: Track) -> str:
@@ -363,7 +483,8 @@ class Music(commands.Cog):
             player.queue_looping = False
             await interaction.response.send_message(
                 f"\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Looping "
-                f"**{esc(player.now_playing.title)}** — run `/loopsong` again to turn it off."
+                f"**{esc(truncate(player.now_playing.title, TITLE_DISPLAY_LIMIT))}** — "
+                "run `/loopsong` again to turn it off."
             )
         else:
             await interaction.response.send_message(
@@ -422,16 +543,25 @@ class Music(commands.Cog):
             raise UserError("The queue is empty — nothing to remove.")
         self._require_same_channel(interaction, player)
 
-        index = self._find_queue_index(player, target.strip())
+        target = target.strip()
+        if not target:
+            raise UserError("Tell me which track to remove — a queue number or part of its name.")
+        index = self._find_queue_index(player, target)
         if index is None:
-            raise UserError(f"Couldn't find anything in the queue matching **{esc(target)}**.")
+            raise UserError(
+                f"Couldn't find anything in the queue matching "
+                f"**{esc(truncate(target, TITLE_DISPLAY_LIMIT))}**."
+            )
         track = player.remove_at(index)
         await interaction.response.send_message(
-            f"\N{WASTEBASKET} Removed #{index + 1}: **{esc(track.title)}**"
+            f"\N{WASTEBASKET} Removed #{index + 1}: "
+            f"**{esc(truncate(track.title, TITLE_DISPLAY_LIMIT))}**"
         )
 
     @staticmethod
     def _find_queue_index(player: GuildPlayer, target: str) -> int | None:
+        if not target:
+            return None  # an empty needle would match every title
         if target.isdigit():
             position = int(target)
             if 1 <= position <= len(player.queue):

@@ -8,7 +8,7 @@ YouTube/SoundCloud and pick from the top 10 results in a dropdown.
 
 ## Features
 
-- `/play` with direct URLs (YouTube, SoundCloud, Bandcamp, and [anything else yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md))
+- `/play` with direct URLs — YouTube, SoundCloud, and Bandcamp out of the box; the `ALLOWED_URL_DOMAINS` setting can open it up to [anything yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)
 - Search by name and pick from a dropdown of the top 10 matches (YouTube by default, SoundCloud via the `source` option)
 - Per-server queue with add, view, skip, jump-the-queue (`/playnext`), and fuzzy remove-by-name
 - Majority-vote skipping (`/skip`) with a no-vote escape hatch (`/forceskip`)
@@ -69,11 +69,18 @@ The compose file sets `restart: unless-stopped`, so the bot comes back on its
 own after crashes and reboots.
 
 To update, run `up` again. The compose file pulls the latest image on every
-start, which also picks up new yt-dlp releases:
+start, and the image is rebuilt weekly (plus on every release) so it tracks
+new yt-dlp releases:
 
 ```sh
 docker compose up -d
 ```
+
+The compose file also runs the container with a read-only filesystem, no
+capabilities, and memory/PID limits. If you want stronger isolation (e.g.
+because you widen `ALLOWED_URL_DOMAINS`), consider firewalling the
+container's egress to your LAN and cloud-metadata ranges — URL allowlisting
+limits which sites yt-dlp is pointed at, but it is not a full SSRF sandbox.
 
 ### Alternative: plain Docker
 
@@ -99,6 +106,9 @@ You'll need:
   - macOS: `brew install ffmpeg`
   - Debian/Ubuntu: `sudo apt install ffmpeg`
   - Windows: `winget install ffmpeg` (or [download](https://ffmpeg.org/download.html))
+- [Deno](https://docs.deno.com/runtime/getting_started/installation/) on your
+  PATH — yt-dlp needs a JavaScript runtime for full YouTube support
+  ([details](https://github.com/yt-dlp/yt-dlp/wiki/EJS))
 
 Then install, configure, and run:
 
@@ -126,6 +136,7 @@ ID for instant sync while testing.
 | `DEV_GUILD_ID`         | no       | Server ID for instant slash-command sync during development. |
 | `IDLE_TIMEOUT_SECONDS` | no       | Seconds before auto-disconnect, for both idle playback and an empty voice channel (default `180`). |
 | `OWNER_ID`             | no       | Your Discord user ID. If set, the bot DMs you when repeated failures suggest yt-dlp needs an update. |
+| `ALLOWED_URL_DOMAINS`  | no       | Which sites direct URLs may point at. Unset: YouTube, SoundCloud, and Bandcamp (subdomains included). A comma-separated domain list **replaces** those defaults. `*` disables the check and allows any yt-dlp-supported site — only do this on servers where you trust everyone, since URLs are fetched from inside your network. |
 
 ## Development
 
@@ -136,9 +147,12 @@ ruff check .      # lint
 ruff format .     # format
 ```
 
-CI runs lint, the test suite on Python 3.10/3.12/3.14, and a Docker build
-check on every push and PR. Pushes to `main` and `v*` tags publish the image
-to GHCR.
+CI runs lint, the test suite on Python 3.10/3.12/3.14, a dependency audit
+(`pip-audit`), and a Docker build + container smoke test on every push and
+PR. Pushes to `main` and `v*` tags publish the image to GHCR only after all
+of those pass — the exact image that was smoke-tested is what gets pushed. A
+weekly scheduled run republishes `latest` so it picks up new yt-dlp releases;
+versioned tags are immutable.
 
 ## Notes
 

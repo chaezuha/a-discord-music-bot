@@ -4,3 +4,14 @@ services:
     pull_policy: always
     env_file: .env
     restart: unless-stopped
+    # Hardening: the container needs no privileges, and only /tmp plus the
+    # bot user's cache (yt-dlp/Deno) have to be writable.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /home/bot/.cache
+    mem_limit: 1g
+    pids_limit: 256

@@ -59,6 +59,8 @@ class FakeVoiceClient:
         self.disconnect_calls = 0
         self.play_error: Exception | None = None
         self._after = None
+        # Set by make_player so finish_track can fake elapsed playback time.
+        self.player = None
 
     def is_connected(self) -> bool:
         return self.connected
@@ -81,8 +83,18 @@ class FakeVoiceClient:
         self.stop_calls += 1
         self.finish_track()
 
-    def finish_track(self, error: Exception | None = None) -> None:
-        """Simulate the current track ending (or being stopped)."""
+    def finish_track(self, error: Exception | None = None, elapsed: float | None = None) -> None:
+        """Simulate the current track ending (or being stopped).
+
+        By default the track's full advertised duration counts as elapsed (a
+        legitimate finish); pass `elapsed` to fake an implausibly early exit
+        (see GuildPlayer._playback_failed).
+        """
+        if self.player is not None and self.player._started_at is not None:
+            track = self.player.now_playing
+            if elapsed is None:
+                elapsed = track.duration if track is not None and track.duration else 10
+            self.player._started_at = time.monotonic() - elapsed
         self.playing = False
         self.paused = False
         after, self._after = self._after, None
@@ -105,8 +117,6 @@ def track_factory():
     def make(title: str = "Test Song", **overrides) -> Track:
         fields = {
             "webpage_url": f"https://example.com/{title.replace(' ', '-')}",
-            # Short enough that instantly-finishing fake playback isn't
-            # mistaken for a dead stream (see SUSPICIOUS_MIN_DURATION).
             "duration": 5,
             "uploader": "Test Uploader",
             "requested_by": "tester",
@@ -155,6 +165,7 @@ async def make_player(voice, channel, monkeypatch):
             on_destroy=on_destroy or (lambda: destroyed.append(True)),
             notifier=notifier,
         )
+        voice.player = player
         players.append(player)
         return player, destroyed
 
