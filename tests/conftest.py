@@ -134,6 +134,7 @@ def track_factory():
             "duration": 5,
             "uploader": "Test Uploader",
             "requested_by": "tester",
+            "requested_by_id": 1000,
         }
         fields.update(overrides)
         return Track(title=title, **fields)
@@ -162,6 +163,7 @@ async def make_player(voice, channel, monkeypatch):
         on_destroy=None,
         notifier=None,
         now_playing_factory=None,
+        finished_factory=None,
     ) -> tuple[GuildPlayer, list]:
         async def default_resolve(track: Track) -> ResolvedStream:
             return fake_stream(track)
@@ -180,6 +182,7 @@ async def make_player(voice, channel, monkeypatch):
             on_destroy=on_destroy or (lambda: destroyed.append(True)),
             notifier=notifier,
             now_playing_factory=now_playing_factory,
+            finished_factory=finished_factory,
         )
         voice.player = player
         players.append(player)

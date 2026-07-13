@@ -756,24 +756,22 @@ async def test_shuffle_command_needs_two_tracks(make_player, voice, track_factor
     assert any("Shuffled 2 tracks" in m for m in interaction.response.messages)
 
 
-async def test_remove_mine_matches_escaped_display_name(
-    make_player, voice, track_factory, wait_until
-):
-    import discord
-
+async def test_remove_mine_matches_requester_id(make_player, voice, track_factory, wait_until):
     player, _ = make_player()
     player.enqueue(track_factory("Song A"))
     await wait_until(lambda: voice.played_sources)
-    # Tracks store the requester pre-escaped, exactly as _play_impl does.
-    escaped = discord.utils.escape_markdown("al_ice")
-    player.enqueue(track_factory("Song B", requested_by=escaped))
-    player.enqueue(track_factory("Song C", requested_by="bob"))
-    player.enqueue(track_factory("Song D", requested_by=escaped))
+    # Ownership is by Discord ID (the caller in make_interaction is id=7):
+    # display names collide across users and change with nicknames.
+    player.enqueue(track_factory("Song B", requested_by="old_nick", requested_by_id=7))
+    player.enqueue(track_factory("Song C", requested_by="alice", requested_by_id=42))
+    player.enqueue(track_factory("Song D", requested_by="old_nick", requested_by_id=7))
 
     cog = make_cog()
     bot_channel = _wire_player(cog, player, voice)
     interaction, _, _ = make_interaction(voice_channel=bot_channel)
-    interaction.user.display_name = "al_ice"
+    # The caller renamed themselves to the same display name as Song C's
+    # requester: their own tracks must still go, the impostor-named one stays.
+    interaction.user.display_name = "alice"
 
     await Music.remove_mine.callback(cog, interaction)
     assert [t.title for t in player.queue] == ["Song C"]
@@ -794,6 +792,58 @@ async def test_remove_mine_without_own_tracks_is_user_error(
 
     with pytest.raises(UserError, match="no tracks"):
         await Music.remove_mine.callback(cog, interaction)
+
+
+async def test_pause_and_resume_commands_refresh_the_card(
+    make_player, voice, track_factory, wait_until
+):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    refreshes = []
+
+    def fake_refresh():
+        refreshes.append(True)
+
+    player.request_np_refresh = fake_refresh
+    cog = make_cog()
+    bot_channel = _wire_player(cog, player, voice)
+
+    interaction, _, _ = make_interaction(voice_channel=bot_channel)
+    await Music.pause.callback(cog, interaction)
+    assert voice.is_paused()
+    assert len(refreshes) == 1  # the card's Pause button must flip to Resume
+
+    interaction, _, _ = make_interaction(voice_channel=bot_channel)
+    await Music.resume.callback(cog, interaction)
+    assert not voice.is_paused()
+    assert len(refreshes) == 2
+
+
+async def test_loop_commands_refresh_the_card(make_player, voice, track_factory, wait_until):
+    player, _ = make_player()
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    refreshes = []
+
+    def fake_refresh():
+        refreshes.append(True)
+
+    player.request_np_refresh = fake_refresh
+    cog = make_cog()
+    bot_channel = _wire_player(cog, player, voice)
+
+    interaction, _, _ = make_interaction(voice_channel=bot_channel)
+    await Music.loopsong.callback(cog, interaction)
+    assert player.song_looping
+    assert len(refreshes) == 1  # the card shows the loop state
+
+    interaction, _, _ = make_interaction(voice_channel=bot_channel)
+    await Music.loopqueue.callback(cog, interaction)
+    assert player.queue_looping and not player.song_looping
+    assert len(refreshes) == 2
 
 
 # -- playlist import ---------------------------------------------------------
@@ -893,7 +943,7 @@ async def test_play_impl_enqueues_playlist_and_reports(monkeypatch, track_factor
     cog = make_playlist_cog()
     player = RecordingPlayer()
 
-    async def fake_fetch_tracks(url, requested_by, playlist_limit):
+    async def fake_fetch_tracks(url, requested_by, playlist_limit, requested_by_id=None):
         assert playlist_limit == 10
         return playlist_result(track_factory, 3, total=20)
 
@@ -917,7 +967,7 @@ async def test_play_impl_single_url_keeps_plain_confirmation(monkeypatch, track_
     cog = make_playlist_cog()
     player = RecordingPlayer()
 
-    async def fake_fetch_tracks(url, requested_by, playlist_limit):
+    async def fake_fetch_tracks(url, requested_by, playlist_limit, requested_by_id=None):
         return FetchResult(tracks=[track_factory("Solo")])
 
     async def ensure(interaction):
@@ -956,6 +1006,8 @@ def test_env_playlist_max_rejects_bad_values(monkeypatch, bad):
 
 # -- queue embed builder / QueueView ---------------------------------------------
 
+
+import discord  # noqa: E402
 
 from musicbot import ui  # noqa: E402
 
@@ -1072,6 +1124,17 @@ def test_queue_wait_seconds_unknown_duration_or_song_loop_is_none(track_factory)
     assert ui.queue_wait_seconds(player, 1) is None  # the unknown is in the way
 
     player.song_looping = True
+    assert ui.queue_wait_seconds(player, 0) is None
+
+
+def test_queue_wait_seconds_paused_is_none(track_factory):
+    # A pause can last indefinitely; "starts in ~…" would be a lie.
+    player = ViewPlayer(
+        [track_factory("A", duration=60)],
+        now=track_factory("Current", duration=100),
+        position=40.0,
+    )
+    player.voice = SimpleNamespace(channel=player.voice.channel, is_paused=lambda: True)
     assert ui.queue_wait_seconds(player, 0) is None
 
 
@@ -1214,6 +1277,22 @@ def test_build_now_playing_embed_unknown_duration_has_no_bar(track_factory):
     embed = ui.build_now_playing_embed(player)
     assert "\N{RADIO BUTTON}" not in embed.description
     assert "`1:30`" in embed.description
+
+
+def test_build_finished_embed_titles_reflect_the_end_reason(track_factory):
+    track = track_factory("Done", duration=180)
+    for reason, title in [
+        ("finished", "Finished Playing"),
+        ("skipped", "Skipped"),
+        ("stopped", "Stopped"),
+        ("failed", "Playback Failed"),
+        ("someday-new-reason", "Playback Ended"),
+    ]:
+        embed = ui.build_finished_embed(track, reason)
+        assert title in embed.title, reason
+    assert ui.build_finished_embed(track).title.endswith("Finished Playing")
+    assert ui.build_finished_embed(track, "failed").color == discord.Color.red()
+    assert ui.build_finished_embed(track, "stopped").color == discord.Color.dark_grey()
 
 
 # -- NowPlayingView -----------------------------------------------------------
@@ -1433,7 +1512,7 @@ async def test_play_impl_search_picker_is_ephemeral(monkeypatch, track_factory):
     cog = make_cog()
     cog.notifier = BreakageNotifier(owner_id=None)
 
-    async def fake_search(query, source, requested_by):
+    async def fake_search(query, source, requested_by, requested_by_id=None):
         return [track_factory("Result")]
 
     monkeypatch.setattr(music_module.sources, "search", fake_search)

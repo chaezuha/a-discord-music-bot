@@ -140,8 +140,9 @@ def queue_totals(tracks: list[Track]) -> tuple[float, bool]:
 
 def queue_wait_seconds(player, index: int) -> float | None:
     """Seconds until queue[index] starts, or None when it can't be estimated
-    (an unknown duration on the way there, or the current song is looping)."""
-    if player.song_looping:
+    (an unknown duration on the way there, the current song looping, or
+    playback paused — a pause can last indefinitely)."""
+    if player.song_looping or player.voice.is_paused():
         return None
     wait = 0.0
     now = player.now_playing
@@ -391,6 +392,27 @@ def build_now_playing_embed(player) -> discord.Embed:
     return embed
 
 
+FINISHED_TITLES = {
+    "finished": "\N{MULTIPLE MUSICAL NOTES} Finished Playing",
+    "skipped": "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE} Skipped",
+    "stopped": "\N{BLACK SQUARE FOR STOP} Stopped",
+    "failed": "\N{WARNING SIGN} Playback Failed",
+}
+
+
+def build_finished_embed(track: Track, reason: str = "finished") -> discord.Embed:
+    """What a now-playing card becomes once its track is over: no progress,
+    loop, or up-next state — just a record of what played and why it ended."""
+    return discord.Embed(
+        title=FINISHED_TITLES.get(reason, "\N{MULTIPLE MUSICAL NOTES} Playback Ended"),
+        description=(
+            f"{fmt_title(track)} ({fmt_duration(track.duration)}) — "
+            f"requested by {track.requested_by or '—'}"
+        ),
+        color=discord.Color.red() if reason == "failed" else discord.Color.dark_grey(),
+    )
+
+
 class NowPlayingView(discord.ui.View):
     """Playback controls under the now-playing card.
 
@@ -410,12 +432,16 @@ class NowPlayingView(discord.ui.View):
     def _sync_pause_button(self) -> None:
         self.pause_button.label = "Resume" if self.player.voice.is_paused() else "Pause"
 
+    def render(self) -> discord.Embed:
+        """Fresh embed + button labels from live player state. Also called by
+        GuildPlayer.refresh_now_message (duck-typed, keeping player.py free of
+        ui imports)."""
+        self._sync_pause_button()
+        return build_now_playing_embed(self.player)
+
     async def refresh(self, interaction: discord.Interaction) -> None:
         """Re-render the card in place — the on-interaction progress update."""
-        self._sync_pause_button()
-        await interaction.response.edit_message(
-            embed=build_now_playing_embed(self.player), view=self
-        )
+        await interaction.response.edit_message(embed=self.render(), view=self)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.player.destroyed or self.player.now_playing is None:

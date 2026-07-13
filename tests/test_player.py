@@ -1099,3 +1099,154 @@ async def test_retry_after_failure_does_not_resend_card(
     await wait_until(lambda: len(voice.played_sources) == 2)  # the silent retry
     assert len(channel.sent) == 1
     assert not views[0].stopped
+
+
+# -- live card refreshes and the finished state ---------------------------------
+
+
+class RenderStubView(StubNowView):
+    """StubNowView that also supports GuildPlayer.refresh_now_message."""
+
+    def __init__(self):
+        super().__init__()
+        self.renders = 0
+
+    def render(self):
+        self.renders += 1
+        return {"render": self.renders}
+
+
+def rendering_np_factory(record):
+    def factory(player):
+        view = RenderStubView()
+        record.append(view)
+        return {"card": player.now_playing.title}, view
+
+    return factory
+
+
+def _recording_finished_factory(track, reason):
+    return {"finished": track.title, "reason": reason}
+
+
+async def test_finished_factory_flips_card_when_track_ends(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(
+        now_playing_factory=np_factory(views),
+        finished_factory=_recording_finished_factory,
+    )
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    voice.finish_track()
+    await wait_until(lambda: channel.sent[0].edits)
+    assert channel.sent[0].edits == [
+        {"view": None, "embed": {"finished": "Song A", "reason": "finished"}}
+    ]
+    assert views[0].stopped
+
+
+async def test_finished_factory_flips_card_on_destroy(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(
+        now_playing_factory=np_factory(views),
+        finished_factory=_recording_finished_factory,
+    )
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+
+    await player.destroy()
+    assert channel.sent[0].edits == [
+        {"view": None, "embed": {"finished": "Song A", "reason": "stopped"}}
+    ]
+
+
+async def test_finished_factory_reports_skip_reason(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(
+        now_playing_factory=np_factory(views),
+        finished_factory=_recording_finished_factory,
+    )
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: voice.played_sources)
+
+    player.skip()
+    await wait_until(lambda: channel.sent[0].edits)
+    assert channel.sent[0].edits == [
+        {"view": None, "embed": {"finished": "Song A", "reason": "skipped"}}
+    ]
+
+
+async def test_np_updater_ticks_the_card_while_playing(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(now_playing_factory=rendering_np_factory(views))
+    player.np_update_interval = 0.01
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+
+    message = channel.sent[0]
+    await wait_until(lambda: len(message.edits) >= 2)
+    assert message.edits[0]["embed"] == {"render": 1}
+    assert message.edits[0]["view"] is views[0]
+
+
+async def test_np_updater_skips_ticks_while_paused(
+    make_player, voice, channel, track_factory, wait_until
+):
+    views = []
+    player, _ = make_player(now_playing_factory=rendering_np_factory(views))
+    player.np_update_interval = 0.01
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+
+    player.pause()
+    await asyncio.sleep(0.03)  # let any in-flight tick land
+    edits_before = len(channel.sent[0].edits)
+    await asyncio.sleep(0.05)
+    assert len(channel.sent[0].edits) == edits_before
+
+
+async def test_queue_changes_coalesce_into_one_card_refresh(
+    make_player, voice, channel, track_factory, wait_until, monkeypatch
+):
+    monkeypatch.setattr("musicbot.player.NP_REFRESH_COALESCE_SECONDS", 0.01)
+    views = []
+    player, _ = make_player(now_playing_factory=rendering_np_factory(views))
+    player.np_update_interval = 60  # keep the periodic ticker out of the way
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+    message = channel.sent[0]
+
+    for title in ("Song B", "Song C", "Song D"):
+        player.enqueue(track_factory(title))
+    await wait_until(lambda: message.edits)
+    await asyncio.sleep(0.05)
+    assert len(message.edits) == 1  # the burst collapsed into a single edit
+
+
+async def test_auto_pause_and_resume_refresh_the_card(
+    make_player, voice, channel, track_factory, wait_until, monkeypatch
+):
+    monkeypatch.setattr("musicbot.player.NP_REFRESH_COALESCE_SECONDS", 0.01)
+    views = []
+    player, _ = make_player(now_playing_factory=rendering_np_factory(views), idle_timeout=60)
+    player.np_update_interval = 60
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+    message = channel.sent[0]
+
+    player.channel_became_empty()
+    assert voice.is_paused()
+    await wait_until(lambda: len(message.edits) >= 1)
+
+    player.channel_became_occupied()
+    assert not voice.is_paused()
+    await wait_until(lambda: len(message.edits) >= 2)

@@ -42,6 +42,14 @@ SUSPICIOUS_FINISH_SECONDS = 2.0
 # Hard cap on queued tracks per guild.
 MAX_QUEUE_SIZE = 500
 
+# How often the now-playing card re-renders its progress bar and Up next field.
+# One tick per progress-bar segment on a typical ~3 minute track, and well
+# clear of Discord's message-edit rate limits.
+NP_UPDATE_INTERVAL_SECONDS = 15.0
+# Queue-mutation refreshes wait this long first, so a burst of enqueues (a
+# playlist import) collapses into a single message edit.
+NP_REFRESH_COALESCE_SECONDS = 0.5
+
 
 class QueueFullError(Exception):
     """The guild's queue is at MAX_QUEUE_SIZE."""
@@ -81,11 +89,13 @@ class GuildPlayer:
         notifier: BreakageNotifier | None = None,
         now_playing_factory: Callable[["GuildPlayer"], tuple[discord.Embed, discord.ui.View]]
         | None = None,
+        finished_factory: Callable[[Track, str], discord.Embed] | None = None,
     ):
         self.bot = bot
         self.voice = voice
         self.text_channel = text_channel
         self.idle_timeout = idle_timeout
+        self.np_update_interval = NP_UPDATE_INTERVAL_SECONDS
         self.queue: deque[Track] = deque()
         self.now_playing: Track | None = None
         self.song_looping = False
@@ -95,8 +105,12 @@ class GuildPlayer:
         self._on_destroy = on_destroy
         self._notifier = notifier
         self._np_factory = now_playing_factory
+        self._finished_factory = finished_factory
         self._now_message: discord.Message | None = None
         self._now_view: discord.ui.View | None = None
+        self._now_card_track: Track | None = None
+        self._np_update_task: asyncio.Task | None = None
+        self._np_refresh_task: asyncio.Task | None = None
         self._track_added = asyncio.Event()
         self._skip_requested = False
         self._started_at: float | None = None
@@ -121,6 +135,7 @@ class GuildPlayer:
         self._track_added.set()
         if self.now_playing is not None and self.queue[0] is track:
             self._prefetch_next()
+        self.request_np_refresh()
         return 1 if front else len(self.queue)
 
     @property
@@ -170,6 +185,7 @@ class GuildPlayer:
             self.voice.pause()
             self.auto_paused = True
             self._mark_paused()
+            self.request_np_refresh()
         if self._empty_task is None or self._empty_task.done():
             self._empty_task = self.bot.loop.create_task(self._empty_channel_timer())
 
@@ -183,6 +199,7 @@ class GuildPlayer:
             if self.voice.is_paused():
                 self.voice.resume()
                 self._mark_resumed()
+                self.request_np_refresh()
 
     def _mark_paused(self) -> None:
         if self._paused_at is None:
@@ -198,6 +215,7 @@ class GuildPlayer:
         del self.queue[index]
         if index == 0:
             self._prefetch_next()  # the old head's prefetch is now stale
+        self.request_np_refresh()
         return track
 
     def move(self, from_index: int, to_index: int) -> Track:
@@ -220,6 +238,7 @@ class GuildPlayer:
         count = len(self.queue)
         self.queue.clear()
         self._prefetch_next()  # cancels the now-stale head prefetch
+        self.request_np_refresh()
         return count
 
     def remove_where(self, predicate: Callable[[Track], bool]) -> list[Track]:
@@ -230,7 +249,36 @@ class GuildPlayer:
             self.queue = deque(t for t in self.queue if not predicate(t))
             if not self.queue or self.queue[0] is not old_head:
                 self._prefetch_next()
+            self.request_np_refresh()
         return removed
+
+    async def refresh_now_message(self) -> None:
+        """Re-render the now-playing card in place after a state change.
+
+        The view is duck-typed (render() -> embed) so this module stays
+        independent of ui.py, mirroring the now_playing_factory indirection.
+        """
+        message, view = self._now_message, self._now_view
+        render = getattr(view, "render", None)
+        if message is None or render is None:
+            return
+        try:
+            await message.edit(embed=render(), view=view)
+        except discord.HTTPException:
+            pass
+
+    def request_np_refresh(self) -> None:
+        """Schedule a card re-render, coalescing bursts into a single edit."""
+        if self._now_message is None or self._destroyed:
+            return
+        if self._np_refresh_task is not None and not self._np_refresh_task.done():
+            return
+
+        async def refresh_soon() -> None:
+            await asyncio.sleep(NP_REFRESH_COALESCE_SECONDS)
+            await self.refresh_now_message()
+
+        self._np_refresh_task = self.bot.loop.create_task(refresh_soon())
 
     async def wait_closed(self) -> None:
         """Block until destroy() has fully finished (voice disconnected)."""
@@ -249,7 +297,7 @@ class GuildPlayer:
             self._empty_task.cancel()
         if self._prefetch_task is not None:
             self._prefetch_task.cancel()
-        await self._clear_now_message()
+        await self._clear_now_message("stopped")
         try:
             self.voice.stop()
             if self.voice.is_connected():
@@ -282,6 +330,9 @@ class GuildPlayer:
                 track = self.queue.popleft()
                 replay = False
                 retried = False
+                # Why the track ended, for the finished card. "stopped" also
+                # covers falling out of the loop when the player is destroyed.
+                end_reason = "stopped"
                 while not self._destroyed:
                     self.now_playing = track
                     self._started_at = None
@@ -302,6 +353,7 @@ class GuildPlayer:
                             await self._notifier.record_failure(self.bot)
                         await self._say(f"\N{WARNING SIGN} Skipping {fmt_title(track)}: {exc}")
                         self.now_playing = None
+                        end_reason = "failed"
                         break
 
                     if self._skip_requested:
@@ -310,6 +362,7 @@ class GuildPlayer:
                         if self.queue_looping:
                             self.queue.append(track)
                         self.now_playing = None
+                        end_reason = "skipped"
                         break
 
                     if self._destroyed or not self.voice.is_connected():
@@ -343,6 +396,7 @@ class GuildPlayer:
                         track.stream = None
                         await self._say(f"\N{WARNING SIGN} Couldn't play {fmt_title(track)}: {exc}")
                         self.now_playing = None
+                        end_reason = "failed"
                         break
                     self._started_at = time.monotonic()
                     self._paused_at = None
@@ -376,6 +430,7 @@ class GuildPlayer:
                             f"\N{WARNING SIGN} Playback of {fmt_title(track)} failed: {reason}"
                         )
                         self.now_playing = None
+                        end_reason = "failed"
                         break
                     if self._notifier is not None:
                         # Success means audio actually played, not merely that
@@ -389,10 +444,13 @@ class GuildPlayer:
                     if self.queue_looping:
                         self.queue.append(track)
                     self.now_playing = None
+                    # A /skip during playback ends the track via voice.stop(),
+                    # which is otherwise indistinguishable from a natural end.
+                    end_reason = "skipped" if self._skip_requested else "finished"
                     break
                 # The track is over one way or another; its controls must not
                 # outlive it, even if nothing else gets announced.
-                await self._clear_now_message()
+                await self._clear_now_message(end_reason)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -464,19 +522,43 @@ class GuildPlayer:
         try:
             self._now_message = await self.text_channel.send(embed=embed, view=view)
             self._now_view = view
+            self._now_card_track = track
+            self._np_update_task = self.bot.loop.create_task(self._np_updater())
         except discord.HTTPException:
             view.stop()
             log.warning("Could not send now-playing message")
 
-    async def _clear_now_message(self) -> None:
-        """Strip the previous now-playing message's controls, if any."""
+    async def _np_updater(self) -> None:
+        """Keep the card's progress bar and Up next field ticking along."""
+        while not self._destroyed and self._now_message is not None:
+            await asyncio.sleep(self.np_update_interval)
+            if self.voice.is_paused():
+                # Position is frozen; pause/resume paths push their own refresh.
+                continue
+            await self.refresh_now_message()
+
+    async def _clear_now_message(self, reason: str = "finished") -> None:
+        """Retire the previous now-playing card, if any: stop its controls and
+        updater, and flip the embed to its finished state.
+
+        The reason ("finished", "skipped", "stopped", "failed") is passed to
+        the finished factory so the card can say why playback ended.
+        """
         message, view = self._now_message, self._now_view
-        self._now_message = self._now_view = None
+        track = self._now_card_track
+        self._now_message = self._now_view = self._now_card_track = None
+        for task in (self._np_update_task, self._np_refresh_task):
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+        self._np_update_task = self._np_refresh_task = None
         if view is not None:
             view.stop()
         if message is not None:
+            kwargs: dict = {"view": None}
+            if self._finished_factory is not None and track is not None:
+                kwargs["embed"] = self._finished_factory(track, reason)
             try:
-                await message.edit(view=None)
+                await message.edit(**kwargs)
             except discord.HTTPException:
                 pass
 

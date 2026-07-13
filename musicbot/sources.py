@@ -91,7 +91,10 @@ class Track:
     webpage_url: str
     duration: int | None
     uploader: str
-    requested_by: str
+    requested_by: str  # escaped display name, for rendering only
+    # Discord user ID — the stable identity for ownership checks like
+    # /remove-mine; display names collide and change.
+    requested_by_id: int | None = None
     thumbnail: str | None = None
     stream: ResolvedStream | None = field(default=None, compare=False)
 
@@ -179,12 +182,16 @@ def _clean_error(exc: Exception) -> str:
     return truncate(message, ERROR_DISPLAY_LIMIT) or "unknown extraction error"
 
 
-def _extract(url_or_query: str, *, flat: bool | str) -> dict:
+def _extract(url_or_query: str, *, flat: bool | str, playlist_end: int | None = None) -> dict:
     """Run yt-dlp. `flat` may be True, False, or "in_playlist" (playlist entries
-    stay flat while a bare video URL still gets a full extraction)."""
+    stay flat while a bare video URL still gets a full extraction).
+    `playlist_end` caps how many playlist entries yt-dlp extracts at all, so a
+    huge playlist can't monopolize the extraction gate or memory."""
     opts = dict(_BASE_OPTS)
     if flat:
         opts["extract_flat"] = flat
+    if playlist_end is not None:
+        opts["playlistend"] = playlist_end
     try:
         with _extract_gate, yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url_or_query, download=False)
@@ -215,7 +222,9 @@ def _thumbnail_from_entry(entry: dict) -> str | None:
     return None
 
 
-def _track_from_entry(entry: dict, requested_by: str, *, flat: bool = False) -> Track:
+def _track_from_entry(
+    entry: dict, requested_by: str, requested_by_id: int | None = None, *, flat: bool = False
+) -> Track:
     # In a flat search entry "url" is the track's page; in a full extraction
     # it can be a signed media URL, which must never become the display link.
     webpage_url = entry.get("webpage_url") or ""
@@ -227,6 +236,7 @@ def _track_from_entry(entry: dict, requested_by: str, *, flat: bool = False) -> 
         duration=entry.get("duration"),
         uploader=entry.get("uploader") or entry.get("channel") or "",
         requested_by=requested_by,
+        requested_by_id=requested_by_id,
         thumbnail=_thumbnail_from_entry(entry),
     )
 
@@ -253,20 +263,22 @@ def _stream_from_info(info: dict) -> ResolvedStream:
     )
 
 
-async def search(query: str, source: str, requested_by: str) -> list[Track]:
+async def search(
+    query: str, source: str, requested_by: str, requested_by_id: int | None = None
+) -> list[Track]:
     """Return up to 10 metadata-only results for a search term."""
     prefix = SEARCH_PREFIXES[source]
     info = await asyncio.to_thread(_extract, f"{prefix}:{query}", flat=True)
     entries = [e for e in (info.get("entries") or []) if e]
-    return [_track_from_entry(e, requested_by, flat=True) for e in entries]
+    return [_track_from_entry(e, requested_by, requested_by_id, flat=True) for e in entries]
 
 
-async def fetch_track(url: str, requested_by: str) -> Track:
+async def fetch_track(url: str, requested_by: str, requested_by_id: int | None = None) -> Track:
     """Fully extract a direct URL into a Track (validates it up front)."""
     check_url_allowed(url)
     info = await asyncio.to_thread(_extract, url, flat=False)
     entry = _first_entry(info)
-    track = _track_from_entry(entry, requested_by)
+    track = _track_from_entry(entry, requested_by, requested_by_id)
     # We already paid for a full extraction; keep the stream so playback
     # doesn't have to extract again.
     try:
@@ -285,19 +297,27 @@ class FetchResult:
     playlist_total: int | None = None  # None -> the URL was a single track
 
 
-async def fetch_tracks(url: str, requested_by: str, playlist_limit: int) -> FetchResult:
+async def fetch_tracks(
+    url: str,
+    requested_by: str,
+    playlist_limit: int,
+    requested_by_id: int | None = None,
+) -> FetchResult:
     """Extract a direct URL into one track or a capped list of playlist tracks.
 
     Playlist entries come back flat — one extraction covers the whole list,
     like search does — while a bare video URL still gets a full extraction
     with its stream cached (noplaylist keeps mixed watch?v=…&list=… URLs on
-    the single video).
+    the single video). The cap is applied inside yt-dlp (playlistend) so a
+    huge playlist is never extracted whole; entries the allowlist filters out
+    below are therefore not topped up from beyond the cap — an acceptable
+    trade against unbounded extraction work.
     """
     check_url_allowed(url)
-    info = await asyncio.to_thread(_extract, url, flat="in_playlist")
+    info = await asyncio.to_thread(_extract, url, flat="in_playlist", playlist_end=playlist_limit)
 
     if "entries" not in info:
-        track = _track_from_entry(info, requested_by)
+        track = _track_from_entry(info, requested_by, requested_by_id)
         # We already paid for a full extraction; keep the stream so playback
         # doesn't have to extract again.
         try:
@@ -309,9 +329,10 @@ async def fetch_tracks(url: str, requested_by: str, playlist_limit: int) -> Fetc
     entries = [e for e in (info.get("entries") or []) if e]
     tracks: list[Track] = []
     for entry in entries:
+        # Defense in depth: some extractors ignore playlistend.
         if len(tracks) >= playlist_limit:
             break
-        track = _track_from_entry(entry, requested_by, flat=True)
+        track = _track_from_entry(entry, requested_by, requested_by_id, flat=True)
         if not track.webpage_url:
             continue
         try:

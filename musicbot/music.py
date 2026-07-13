@@ -44,6 +44,7 @@ from .ui import (
     NowPlayingView,
     QueueView,
     SearchPicker,
+    build_finished_embed,
     build_now_playing_embed,
     clamp_description,
     fmt_progress,
@@ -180,6 +181,7 @@ class Music(commands.Cog):
                     build_now_playing_embed(p),
                     NowPlayingView(p, self),
                 ),
+                finished_factory=build_finished_embed,
             )
             self.players[guild_id] = player
             return player
@@ -298,12 +300,16 @@ class Music(commands.Cog):
 
         await interaction.response.defer()
         requested_by = esc(interaction.user.display_name)
+        requested_by_id = interaction.user.id
 
         if is_url(query):
             # Failures here don't feed the breakage notifier: user-typed URLs
             # are typo-prone and deliberately triggerable.
             result = await sources.fetch_tracks(
-                query, requested_by=requested_by, playlist_limit=self.playlist_max
+                query,
+                requested_by=requested_by,
+                playlist_limit=self.playlist_max,
+                requested_by_id=requested_by_id,
             )
             player = await self._ensure_player(interaction)
             if result.playlist_total is None:
@@ -316,7 +322,9 @@ class Music(commands.Cog):
 
         source_key = source.value if source else "youtube"
         try:
-            tracks = await sources.search(query, source_key, requested_by=requested_by)
+            tracks = await sources.search(
+                query, source_key, requested_by=requested_by, requested_by_id=requested_by_id
+            )
         except SourceError:
             # A bot-formed search against a known-good site failing is a real
             # breakage signal, unlike an arbitrary user-typed URL.
@@ -417,6 +425,10 @@ class Music(commands.Cog):
             raise UserError("Nothing is playing right now.")
         player.pause()
         await interaction.response.send_message("\N{DOUBLE VERTICAL BAR} Paused.")
+        # The card's Pause button and paused marker must follow slash-command
+        # state changes too, not just its own clicks — but only after the
+        # interaction is acknowledged, so a slow card edit can't time it out.
+        player.request_np_refresh()
 
     @app_commands.command(description="Resume paused playback")
     @app_commands.guild_only()
@@ -427,6 +439,7 @@ class Music(commands.Cog):
             raise UserError("Nothing is paused right now.")
         player.resume()
         await interaction.response.send_message("\N{BLACK RIGHT-POINTING TRIANGLE} Resumed.")
+        player.request_np_refresh()
 
     @app_commands.command(
         description="Vote to skip the current track (majority of the voice channel)"
@@ -553,6 +566,7 @@ class Music(commands.Cog):
         player.song_looping = not player.song_looping
         if player.song_looping:
             player.queue_looping = False
+        if player.song_looping:
             await interaction.response.send_message(
                 f"\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Looping "
                 f"**{esc(truncate(player.now_playing.title, TITLE_DISPLAY_LIMIT))}** — "
@@ -563,6 +577,7 @@ class Music(commands.Cog):
                 "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Song loop off — "
                 "the queue will advance normally."
             )
+        player.request_np_refresh()  # the card shows the loop state
 
     @app_commands.command(
         description="Toggle looping the whole queue (finished tracks return to the end)"
@@ -576,6 +591,7 @@ class Music(commands.Cog):
         player.queue_looping = not player.queue_looping
         if player.queue_looping:
             player.song_looping = False
+        if player.queue_looping:
             await interaction.response.send_message(
                 "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Looping the queue — "
                 "finished tracks go back to the end. Run `/loopqueue` again to turn it off."
@@ -585,6 +601,7 @@ class Music(commands.Cog):
                 "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS} Queue loop off — "
                 "the queue will advance normally."
             )
+        player.request_np_refresh()  # the card shows the loop state
 
     @app_commands.command(description="Show all commands and what they do")
     async def help(self, interaction: discord.Interaction) -> None:
@@ -733,10 +750,11 @@ class Music(commands.Cog):
         if player is None or not player.queue:
             raise UserError("The queue is empty — nothing to remove.")
         self._require_same_channel(interaction, player)
-        # Tracks store the requester as an escaped display name (see _play_impl),
-        # so the comparison key must be escaped the same way.
-        requester = esc(interaction.user.display_name)
-        removed = player.remove_where(lambda t: t.requested_by == requester)
+        # Match by Discord ID, not display name: names collide across users
+        # and change with nicknames. (requested_by_id is never None on tracks
+        # queued through /play, and an int never equals None.)
+        requester_id = interaction.user.id
+        removed = player.remove_where(lambda t: t.requested_by_id == requester_id)
         if not removed:
             raise UserError("You have no tracks in the queue.")
         plural = "s" if len(removed) != 1 else ""

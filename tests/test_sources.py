@@ -23,10 +23,10 @@ from musicbot.sources import (
 
 def patch_extract(monkeypatch, result: dict):
     """Replace sources._extract with a canned result; returns the call log."""
-    calls: list[tuple[str, bool]] = []
+    calls: list[tuple[str, bool, int | None]] = []
 
-    def fake_extract(url_or_query: str, *, flat: bool) -> dict:
-        calls.append((url_or_query, flat))
+    def fake_extract(url_or_query: str, *, flat: bool, playlist_end: int | None = None) -> dict:
+        calls.append((url_or_query, flat, playlist_end))
         return result
 
     monkeypatch.setattr(sources, "_extract", fake_extract)
@@ -237,8 +237,8 @@ async def test_search_uses_source_prefix_and_flat(monkeypatch):
     await sources.search("hello world", "youtube", requested_by="me")
     await sources.search("hello world", "soundcloud", requested_by="me")
     assert calls == [
-        ("ytsearch10:hello world", True),
-        ("scsearch10:hello world", True),
+        ("ytsearch10:hello world", True, None),
+        ("scsearch10:hello world", True, None),
     ]
 
 
@@ -280,7 +280,7 @@ async def test_fetch_track_single_video(monkeypatch):
         {"title": "Song", "webpage_url": "https://w", "duration": 42, "uploader": "U"},
     )
     track = await sources.fetch_track(VIDEO_URL, requested_by="me")
-    assert calls == [(VIDEO_URL, False)]
+    assert calls == [(VIDEO_URL, False, None)]
     assert (track.title, track.webpage_url, track.duration) == ("Song", "https://w", 42)
 
 
@@ -442,7 +442,7 @@ async def test_fetch_tracks_single_video_keeps_full_extraction(monkeypatch):
         },
     )
     result = await sources.fetch_tracks(VIDEO_URL, requested_by="me", playlist_limit=10)
-    assert calls == [(VIDEO_URL, "in_playlist")]
+    assert calls == [(VIDEO_URL, "in_playlist", 10)]
     assert result.playlist_total is None
     assert result.playlist_title is None
     (track,) = result.tracks
@@ -452,7 +452,9 @@ async def test_fetch_tracks_single_video_keeps_full_extraction(monkeypatch):
 
 
 async def test_fetch_tracks_playlist_respects_limit(monkeypatch):
-    patch_extract(
+    # 15 entries despite playlistend=10: extractors may ignore the cap, so the
+    # Python-side truncation must hold on its own.
+    calls = patch_extract(
         monkeypatch,
         {
             "title": "My Mix",
@@ -463,12 +465,27 @@ async def test_fetch_tracks_playlist_respects_limit(monkeypatch):
         },
     )
     result = await sources.fetch_tracks(PLAYLIST_URL, requested_by="me", playlist_limit=10)
+    # The cap is pushed into yt-dlp so a huge playlist is never extracted whole.
+    assert calls == [(PLAYLIST_URL, "in_playlist", 10)]
     assert len(result.tracks) == 10
     assert result.playlist_title == "My Mix"
     assert result.playlist_total == 40
     # Flat entries use their page URL as the display link.
     assert result.tracks[0].webpage_url == "https://youtube.com/watch?v=0"
     assert all(t.requested_by == "me" for t in result.tracks)
+
+
+async def test_tracks_carry_requester_id(monkeypatch):
+    patch_extract(
+        monkeypatch,
+        {"title": "Mix", "entries": [{"title": "A", "url": "https://youtube.com/watch?v=a"}]},
+    )
+    (track,) = await sources.search("q", "youtube", requested_by="me", requested_by_id=123)
+    assert track.requested_by_id == 123
+    result = await sources.fetch_tracks(
+        PLAYLIST_URL, requested_by="me", playlist_limit=5, requested_by_id=123
+    )
+    assert all(t.requested_by_id == 123 for t in result.tracks)
 
 
 async def test_fetch_tracks_total_falls_back_to_entry_count(monkeypatch):
