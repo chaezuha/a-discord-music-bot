@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from collections import deque
 from types import SimpleNamespace
 
@@ -1277,6 +1279,34 @@ def test_build_now_playing_embed_unknown_duration_has_no_bar(track_factory):
     embed = ui.build_now_playing_embed(player)
     assert "\N{RADIO BUTTON}" not in embed.description
     assert "`1:30`" in embed.description
+
+
+def test_build_now_playing_embed_shows_live_end_timestamp(track_factory):
+    track = track_factory("Current", duration=180)
+    player = ViewPlayer([], now=track, position=60.0)
+    before = time.time()
+    embed = ui.build_now_playing_embed(player)
+    after = time.time()
+
+    match = re.search(r"Ends <t:(\d+):R>", embed.description)
+    assert match is not None
+    remaining = 180 - 60
+    assert int(before) + remaining - 1 <= int(match.group(1)) <= int(after) + remaining + 1
+
+
+def test_build_now_playing_embed_hides_end_timestamp_when_unreliable(track_factory):
+    track = track_factory("Current", duration=180)
+
+    paused = ViewPlayer([], now=track, position=60.0)
+    paused.voice = SimpleNamespace(channel=None, is_paused=lambda: True)
+    assert "Ends <t:" not in ui.build_now_playing_embed(paused).description
+
+    looping = ViewPlayer([], now=track, position=60.0)
+    looping.song_looping = True
+    assert "Ends <t:" not in ui.build_now_playing_embed(looping).description
+
+    unknown = ViewPlayer([], now=track_factory("Live", duration=None), position=60.0)
+    assert "Ends <t:" not in ui.build_now_playing_embed(unknown).description
 
 
 def test_build_finished_embed_titles_reflect_the_end_reason(track_factory):

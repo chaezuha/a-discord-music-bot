@@ -110,7 +110,7 @@ class GuildPlayer:
         self._now_view: discord.ui.View | None = None
         self._now_card_track: Track | None = None
         self._np_update_task: asyncio.Task | None = None
-        self._np_refresh_task: asyncio.Task | None = None
+        self._np_refresh_requested = asyncio.Event()
         self._track_added = asyncio.Event()
         self._skip_requested = False
         self._started_at: float | None = None
@@ -264,21 +264,19 @@ class GuildPlayer:
             return
         try:
             await message.edit(embed=render(), view=view)
+        except (discord.NotFound, discord.Forbidden):
+            # The card was deleted or became unreachable; stop maintaining it.
+            # _np_updater exits on its own once _now_message is None.
+            self._now_message = self._now_view = self._now_card_track = None
+            view.stop()
         except discord.HTTPException:
             pass
 
     def request_np_refresh(self) -> None:
-        """Schedule a card re-render, coalescing bursts into a single edit."""
+        """Ask the updater for a card re-render, coalescing bursts into one edit."""
         if self._now_message is None or self._destroyed:
             return
-        if self._np_refresh_task is not None and not self._np_refresh_task.done():
-            return
-
-        async def refresh_soon() -> None:
-            await asyncio.sleep(NP_REFRESH_COALESCE_SECONDS)
-            await self.refresh_now_message()
-
-        self._np_refresh_task = self.bot.loop.create_task(refresh_soon())
+        self._np_refresh_requested.set()
 
     async def wait_closed(self) -> None:
         """Block until destroy() has fully finished (voice disconnected)."""
@@ -523,18 +521,32 @@ class GuildPlayer:
             self._now_message = await self.text_channel.send(embed=embed, view=view)
             self._now_view = view
             self._now_card_track = track
+            self._np_refresh_requested.clear()  # stale requests belong to the old card
             self._np_update_task = self.bot.loop.create_task(self._np_updater())
         except discord.HTTPException:
             view.stop()
             log.warning("Could not send now-playing message")
 
     async def _np_updater(self) -> None:
-        """Keep the card's progress bar and Up next field ticking along."""
+        """Keep the card's progress bar and Up next field ticking along.
+
+        The sole owner of card edits: periodic ticks and coalesced state
+        refreshes (request_np_refresh) both land here, so edits never overlap.
+        A request that arrives while an edit is in flight re-sets the event
+        and is picked up on the next iteration rather than being dropped.
+        """
         while not self._destroyed and self._now_message is not None:
-            await asyncio.sleep(self.np_update_interval)
-            if self.voice.is_paused():
-                # Position is frozen; pause/resume paths push their own refresh.
-                continue
+            try:
+                await asyncio.wait_for(
+                    self._np_refresh_requested.wait(), timeout=self.np_update_interval
+                )
+            except asyncio.TimeoutError:
+                if self.voice.is_paused():
+                    # Position is frozen; pause/resume request their own refresh.
+                    continue
+            else:
+                await asyncio.sleep(NP_REFRESH_COALESCE_SECONDS)
+                self._np_refresh_requested.clear()
             await self.refresh_now_message()
 
     async def _clear_now_message(self, reason: str = "finished") -> None:
@@ -547,10 +559,11 @@ class GuildPlayer:
         message, view = self._now_message, self._now_view
         track = self._now_card_track
         self._now_message = self._now_view = self._now_card_track = None
-        for task in (self._np_update_task, self._np_refresh_task):
-            if task is not None and task is not asyncio.current_task():
-                task.cancel()
-        self._np_update_task = self._np_refresh_task = None
+        task = self._np_update_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        self._np_update_task = None
+        self._np_refresh_requested.clear()
         if view is not None:
             view.stop()
         if message is not None:

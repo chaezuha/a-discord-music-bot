@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+from types import SimpleNamespace
 
+import discord
 import pytest
 
 from musicbot import player as player_module
@@ -1230,6 +1232,63 @@ async def test_queue_changes_coalesce_into_one_card_refresh(
     await wait_until(lambda: message.edits)
     await asyncio.sleep(0.05)
     assert len(message.edits) == 1  # the burst collapsed into a single edit
+
+
+async def test_refresh_requested_during_edit_is_not_lost(
+    make_player, voice, channel, track_factory, wait_until, monkeypatch
+):
+    monkeypatch.setattr("musicbot.player.NP_REFRESH_COALESCE_SECONDS", 0.01)
+    views = []
+    player, _ = make_player(now_playing_factory=rendering_np_factory(views))
+    player.np_update_interval = 60
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+    message = channel.sent[0]
+
+    gate = asyncio.Event()
+    edits: list[dict] = []
+
+    async def slow_edit(**kwargs):
+        edits.append(kwargs)
+        await gate.wait()
+
+    message.edit = slow_edit
+    player.request_np_refresh()
+    await wait_until(lambda: len(edits) == 1)  # first edit is in flight
+
+    player.request_np_refresh()  # arrives mid-edit; must not be dropped
+    gate.set()
+    await wait_until(lambda: len(edits) == 2)
+    assert edits[1]["embed"] == {"render": 2}  # a fresh render, not a replay
+
+
+@pytest.mark.parametrize("error_cls", [discord.NotFound, discord.Forbidden])
+async def test_dead_card_stops_the_updater(
+    make_player, voice, channel, track_factory, wait_until, error_cls
+):
+    views = []
+    player, _ = make_player(now_playing_factory=rendering_np_factory(views))
+    player.np_update_interval = 0.01
+    player.enqueue(track_factory("Song A"))
+    await wait_until(lambda: channel.sent)
+    message = channel.sent[0]
+
+    attempts: list[dict] = []
+
+    async def edit_gone(**kwargs):
+        attempts.append(kwargs)
+        raise error_cls(SimpleNamespace(status=404, reason="Not Found"), "unknown message")
+
+    message.edit = edit_gone
+    await wait_until(lambda: attempts)
+    await asyncio.sleep(0.05)
+    assert len(attempts) == 1  # the updater retired the card instead of retrying
+    assert views[0].stopped
+    assert player._now_message is None
+
+    voice.finish_track()  # track-end teardown must not touch the dead message
+    await asyncio.sleep(0.03)
+    assert len(attempts) == 1
 
 
 async def test_auto_pause_and_resume_refresh_the_card(

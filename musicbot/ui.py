@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -369,6 +370,18 @@ def build_now_playing_embed(player) -> discord.Embed:
     if bar:
         lines.append(bar)
     lines.append(f"`{fmt_progress(player, track)}`")
+    position = player.position
+    if (
+        track.duration
+        and position is not None
+        and not player.voice.is_paused()
+        and not player.song_looping
+    ):
+        # Discord renders <t:...:R> live client-side, so this keeps counting
+        # between the card's periodic re-edits. Hidden while paused (the end
+        # time would be wrong) and under song-loop (the track restarts).
+        end_ts = int(time.time() + max(0.0, track.duration - position))
+        lines.append(f"Ends <t:{end_ts}:R>")
     if player.voice.is_paused():
         lines.append("\N{DOUBLE VERTICAL BAR} Paused")
     embed = discord.Embed(
