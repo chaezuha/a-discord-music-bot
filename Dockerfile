@@ -16,7 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 COPY musicbot/ musicbot/
 
-RUN useradd --create-home bot
+RUN useradd --create-home bot \
+    && mkdir -p /app/logs \
+    && chown bot:bot /app/logs
 USER bot
 
 CMD ["python", "bot.py"]

@@ -3,6 +3,10 @@ services:
     image: ghcr.io/chaezuha/discord-music-bot:latest
     pull_policy: always
     env_file: .env
+    environment:
+      # Exit (and get restarted fresh by the policy below) after being
+      # disconnected from Discord this long. Override via .env.
+      WATCHDOG_DISCONNECT_SECONDS: ${WATCHDOG_DISCONNECT_SECONDS:-300}
     restart: unless-stopped
     # Hardening: the container needs no privileges, and only /tmp plus the
     # bot user's cache (yt-dlp/Deno) have to be writable.
@@ -13,5 +17,14 @@ services:
     tmpfs:
       - /tmp
       - /home/bot/.cache
+    # Rotating log files survive restarts; read with
+    #   docker compose exec bot tail -F logs/bot.log
+    # (A ./logs:/app/logs bind mount also works if you create the directory
+    # yourself with permissions the container's "bot" user can write to.)
+    volumes:
+      - botlogs:/app/logs
     mem_limit: 1g
     pids_limit: 256
+
+volumes:
+  botlogs:

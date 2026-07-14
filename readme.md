@@ -75,7 +75,29 @@ docker compose logs -f        # follow logs
 ```
 
 The compose file sets `restart: unless-stopped`, so the bot comes back on its
-own after crashes and reboots.
+own after crashes and reboots. It also enables a connection watchdog
+(`WATCHDOG_DISCONNECT_SECONDS=300`): if the bot is cut off from Discord for
+more than 5 minutes — say your router restarts and the reconnect never
+completes — it exits and the restart policy brings it back with a fresh
+session.
+
+#### Logs
+
+Besides `docker compose logs`, the bot writes rotating log files (about
+10 MB of recent history, including whatever led up to a crash or
+disconnect) to a `botlogs` volume:
+
+```sh
+docker compose exec bot tail -F logs/bot.log
+```
+
+Use `tail -F` (capital F) so following continues across log rotation. The
+same directory holds `faulthandler.log`, a normally-empty file that only
+receives a traceback if the process dies hard (e.g. a native-library crash).
+If you'd rather have the files directly on the host, replace the `botlogs`
+volume with a `./logs:/app/logs` bind mount — but create `./logs` yourself
+with permissions the container's `bot` user can write to, or the bot falls
+back to console-only logging.
 
 To update, run `up` again. The compose file pulls the latest image on every
 start, and the image is rebuilt weekly (plus on every release) so it tracks
@@ -146,6 +168,8 @@ ID for instant sync while testing.
 | `IDLE_TIMEOUT_SECONDS` | no       | Seconds before auto-disconnect, for both idle playback and an empty voice channel (default `180`). |
 | `PLAYLIST_MAX_TRACKS`  | no       | How many tracks `/play` imports from a playlist or album URL (default `10`, max `500`). |
 | `OWNER_ID`             | no       | Your Discord user ID. If set, the bot DMs you when repeated failures suggest yt-dlp needs an update. |
+| `LOG_DIR`              | no       | Directory for rotating log files (default `./logs`). Falls back to console-only logging if unwritable. |
+| `WATCHDOG_DISCONNECT_SECONDS` | no | Exit after being disconnected from Discord this long, so a supervisor can restart the bot fresh. Default `0` (disabled); `compose.yaml` sets `300`. Only enable outside Docker if something (systemd, a shell loop) restarts the process for you. |
 | `ALLOWED_URL_DOMAINS`  | no       | Which sites direct URLs may point at. Unset: YouTube, SoundCloud, and Bandcamp (subdomains included). A comma-separated domain list **replaces** those defaults. `*` disables the check and allows any yt-dlp-supported site — only do this on servers where you trust everyone, since URLs are fetched from inside your network. |
 
 ## Development

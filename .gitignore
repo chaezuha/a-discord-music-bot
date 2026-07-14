@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Runtime logs
+logs/
+
 # Python
 .venv/
 venv/
