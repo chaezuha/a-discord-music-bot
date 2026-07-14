@@ -64,15 +64,22 @@ channel; `/queue` and `/help` are open to everyone.
 
 ### 2. Run with Docker Compose (recommended)
 
-You don't need to clone the repo. The prebuilt image includes ffmpeg and
-everything else. Put [`compose.yaml`](compose.yaml) and a `.env` (see
-[`.env.example`](.env.example)) in a folder, paste your bot token into `.env`,
-then:
+Clone the repo, paste your bot token into `.env`, and start it:
 
 ```sh
-docker compose up -d          # pulls the prebuilt GHCR image
+git clone https://github.com/chaezuha/discord-music-bot.git
+cd discord-music-bot
+cp .env.example .env          # then edit .env and paste your bot token
+docker compose up -d          # pulls the prebuilt GHCR image (no local build)
 docker compose logs -f        # follow logs
 ```
+
+Nothing is built locally — the compose file pulls the prebuilt image, which
+includes ffmpeg and everything else. Technically the only files you need are
+[`compose.yaml`](compose.yaml) and a `.env` (see
+[`.env.example`](.env.example)); the clone is just a convenient way to get
+them. If you'd rather skip it, put those two files in any folder and run the
+same `docker compose` commands there — the result is identical.
 
 The compose file sets `restart: unless-stopped`, so the bot comes back on its
 own after crashes and reboots. It also enables a connection watchdog
